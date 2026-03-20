@@ -159,18 +159,46 @@ Two workflows live under `.github/workflows/`:
 | Workflow | When it runs | What it does |
 |----------|----------------|---------------|
 | **CI** (`ci.yml`) | Every push / PR to `main` or `master` | `sam validate`, `sam build`, unit tests — **no AWS credentials** needed. |
-| **Deploy** (`deploy.yml`) | **Actions → Deploy → Run workflow** (manual) | `sam build` + `sam deploy` using AWS keys from repo **Secrets**. |
+| **Deploy** (`deploy.yml`) | **Actions → Deploy → Run workflow** (manual) | `sam build` + `sam deploy` using AWS **OIDC role assumption** (no long-lived access keys). |
 
 ### One-time setup for deploy
 
-1. In GitHub: **Settings → Secrets and variables → Actions → New repository secret**
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-2. Optional: **Settings → Variables → Actions** → add `AWS_REGION` (e.g. `us-east-1`). If omitted, deploy uses `us-east-1`.
-3. **Commit `samconfig.toml`** from your machine (after `sam deploy --guided`) so CI/CD can deploy non-interactively — it should **not** contain API keys (those stay in Secrets Manager per this template). Or hard-code `--stack-name` and `--parameter-overrides` in `deploy.yml`.
-4. To deploy on every merge to `main`, edit `deploy.yml` and add a `push:` trigger (see comments in that file).
+1. In AWS IAM, create a role trusted by GitHub OIDC provider (`token.actions.githubusercontent.com`) with trust policy restricting your repo/branch (example below).
+2. Attach deploy permissions to that role (CloudFormation, Lambda, IAM pass role if needed, S3 artifacts, etc. — same permissions you use locally for `sam deploy`).
+3. In GitHub: **Settings → Secrets and variables → Actions → Variables**:
+   - `AWS_GITHUB_OIDC_ROLE_ARN` = `arn:aws:iam::<account-id>:role/<your-oidc-role>`
+   - optional `AWS_REGION` (default is `us-east-1` if omitted)
+4. **Commit `samconfig.toml`** from your machine (after `sam deploy --guided`) so CI/CD can deploy non-interactively — it should **not** contain API keys (those stay in Secrets Manager per this template). Or hard-code `--stack-name` and `--parameter-overrides` in `deploy.yml`.
+5. To deploy on every merge to `main`, edit `deploy.yml` and add a `push:` trigger (see comments in that file).
 
-For **OIDC** (no long-lived access keys), use IAM role + `aws-actions/configure-aws-credentials` with `role-to-assume` instead of access keys — see [AWS’s GitHub OIDC guide](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services).
+Example trust policy (replace `<ACCOUNT_ID>`, `<ORG>`, `<REPO>`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:<ORG>/<REPO>:ref:refs/heads/main",
+            "repo:<ORG>/<REPO>:ref:refs/heads/master",
+            "repo:<ORG>/<REPO>:pull_request"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
 
 ## Tests (unit)
 

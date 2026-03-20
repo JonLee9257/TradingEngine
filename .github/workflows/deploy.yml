@@ -1,4 +1,4 @@
-# Deploy to AWS from GitHub (manual by default — avoids failed runs before secrets exist).
+# Deploy to AWS from GitHub via OIDC (no long-lived AWS keys).
 #
 # To deploy on every push to main, add under `on:`:
 #   push:
@@ -33,8 +33,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ vars.AWS_GITHUB_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-sam-deploy
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: SAM build
