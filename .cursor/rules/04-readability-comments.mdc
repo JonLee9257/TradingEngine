@@ -1,0 +1,13 @@
+---
+description: Keep code readable with concise, high-value comments
+alwaysApply: true
+---
+
+# Readability and comments
+
+- Prefer clear names and small functions so intent is obvious without heavy comments.
+- Add comments for non-obvious logic, edge cases, and business constraints (the "why"), not line-by-line narration (the "what").
+- Keep comments short and maintainable; remove stale comments when code changes.
+- Avoid dead code and large commented-out blocks.
+- Keep formatting consistent and avoid deeply nested logic when a helper function improves readability.
+

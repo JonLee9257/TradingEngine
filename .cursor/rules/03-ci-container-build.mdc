@@ -1,0 +1,10 @@
+---
+description: Keep GitHub Actions builds aligned with Lambda runtime
+globs: **/.github/workflows/*.yml
+alwaysApply: false
+---
+
+# Containerized build requirement
+
+- Use `sam build --use-container` in CI (and deploy steps) so native deps build on the same OS family as Lambda.
+
