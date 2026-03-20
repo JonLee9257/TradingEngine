@@ -13,12 +13,13 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from decimal import Decimal
 
 import boto3
+import requests
 from anthropic import Anthropic
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr
@@ -127,6 +128,167 @@ def _backoff_sleep(attempt: int) -> None:
     max_sleep = float(os.getenv("ANTHROPIC_BACKOFF_MAX_SECONDS", "15"))
     sleep_s = min(max_sleep, base * (2 ** (attempt - 1)))
     time.sleep(sleep_s)
+
+
+def _price_backoff_sleep(attempt: int) -> None:
+    # Exponential backoff for Alpaca market data API failures.
+    base = float(os.getenv("ALPACA_PRICE_BACKOFF_BASE_SECONDS", "0.5"))
+    max_sleep = float(os.getenv("ALPACA_PRICE_BACKOFF_MAX_SECONDS", "10"))
+    sleep_s = min(max_sleep, base * (2 ** (attempt - 1)))
+    time.sleep(sleep_s)
+
+
+def _fetch_latest_price_with_alpaca(symbol: str) -> dict:
+    """
+    Fetch latest trade price from Alpaca market data API for backtesting-grade logging.
+    Returns {"price": Decimal, "fetched_at": iso8601, "source": "alpaca_latest_trade"}.
+    """
+    api_key = os.environ["ALPACA_API_KEY"]
+    api_secret = os.environ["ALPACA_SECRET_KEY"]
+    max_attempts = int(os.getenv("ALPACA_PRICE_MAX_ATTEMPTS", "3"))
+    timeout_s = float(os.getenv("ALPACA_PRICE_TIMEOUT_SECONDS", "10"))
+    # Separate URL so paper/live endpoints can be swapped if needed.
+    base_url = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+    url = f"{base_url}/v2/stocks/{symbol}/trades/latest"
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout_s)
+            if 500 <= resp.status_code:
+                raise RuntimeError(f"Alpaca data server error: {resp.status_code} {resp.text[:200]}")
+            resp.raise_for_status()
+            data = resp.json()
+            trade = data.get("trade") or {}
+            # Alpaca usually returns "p" as latest trade price.
+            raw_price = trade.get("p")
+            if raw_price in (None, ""):
+                raise RuntimeError(f"Alpaca latest trade price missing in response: {data}")
+            return {
+                "price": Decimal(str(raw_price)),
+                "fetched_at": _utc_now_iso(),
+                "source": "alpaca_latest_trade",
+            }
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "Failed fetching latest price from Alpaca",
+                extra={"symbol": symbol, "attempt": attempt, "max_attempts": max_attempts, "error": str(e)},
+            )
+            if attempt < max_attempts:
+                _price_backoff_sleep(attempt)
+
+    raise RuntimeError(f"Alpaca latest price fetch failed after {max_attempts} attempts: {last_err}")
+
+
+def _parse_iso8601_utc(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    # Handle both "...Z" and "+00:00" forms.
+    normalized = ts.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso8601_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _representative_published_at(articles: list[dict]) -> Optional[str]:
+    """
+    Pick a representative news timestamp for price backfill.
+    Current strategy: latest valid `publishedAt` in the provided article list.
+    """
+    parsed = [_parse_iso8601_utc((a.get("publishedAt") or "").strip()) for a in (articles or [])]
+    valid = [dt for dt in parsed if dt is not None]
+    if not valid:
+        return None
+    return _iso8601_z(max(valid))
+
+
+def _fetch_price_at_published_time_with_alpaca(symbol: str, published_at: str) -> dict:
+    """
+    Fetch a 1-minute historical bar near `published_at` and return a backtesting-ready price snapshot.
+    Returns:
+      {
+        "price": Decimal,
+        "price_timestamp": "<bar time>",
+        "reference_published_at": "<news time>",
+        "source": "alpaca_bars_1min_close"
+      }
+    """
+    api_key = os.environ["ALPACA_API_KEY"]
+    api_secret = os.environ["ALPACA_SECRET_KEY"]
+    max_attempts = int(os.getenv("ALPACA_PRICE_MAX_ATTEMPTS", "3"))
+    timeout_s = float(os.getenv("ALPACA_PRICE_TIMEOUT_SECONDS", "10"))
+    base_url = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+    published_dt = _parse_iso8601_utc(published_at)
+    if published_dt is None:
+        raise ValueError(f"Invalid published_at timestamp: {published_at}")
+    start = _iso8601_z(published_dt)
+    # 1-minute bar usually exists shortly after timestamp; use a short forward window.
+    end = _iso8601_z(published_dt + timedelta(minutes=2))
+    url = f"{base_url}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Min",
+        "start": start,
+        "end": end,
+        "limit": 1,
+        "sort": "asc",
+        "adjustment": "raw",
+        "feed": os.getenv("ALPACA_DATA_FEED", "iex"),
+    }
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout_s)
+            if 500 <= resp.status_code:
+                raise RuntimeError(f"Alpaca data server error: {resp.status_code} {resp.text[:200]}")
+            resp.raise_for_status()
+            data = resp.json()
+            bars = data.get("bars") or []
+            if not bars:
+                raise RuntimeError(f"No 1-minute bars returned for symbol={symbol} at published_at={published_at}")
+            bar = bars[0]
+            close_raw = bar.get("c")
+            if close_raw in (None, ""):
+                raise RuntimeError(f"Close price missing in bar response: {bar}")
+            return {
+                "price": Decimal(str(close_raw)),
+                "price_timestamp": (bar.get("t") or ""),
+                "reference_published_at": published_at,
+                "source": "alpaca_bars_1min_close",
+            }
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "Failed fetching historical price from Alpaca",
+                extra={
+                    "symbol": symbol,
+                    "published_at": published_at,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "error": str(e),
+                },
+            )
+            if attempt < max_attempts:
+                _price_backoff_sleep(attempt)
+
+    raise RuntimeError(f"Alpaca historical price fetch failed after {max_attempts} attempts: {last_err}")
 
 
 def _build_prompt(symbols: list[str], articles_by_symbol: dict) -> str:
@@ -272,6 +434,18 @@ def _put_sentiment_item(*, table, run_id: str, symbol: str, item: dict, source: 
         "model": source.get("model"),
         "lambda_request_id": source.get("lambda_request_id"),
     }
+    # Backtesting data-pipeline extension:
+    # store point-in-time market price captured during sentiment processing.
+    if item.get("market_price") is not None:
+        payload["market_price"] = Decimal(str(item["market_price"]))
+        payload["market_price_fetched_at"] = item.get("market_price_fetched_at")
+        payload["market_price_source"] = item.get("market_price_source") or "alpaca_latest_trade"
+    if item.get("news_published_at"):
+        payload["news_published_at"] = item.get("news_published_at")
+    if item.get("market_price_at_news") is not None:
+        payload["market_price_at_news"] = Decimal(str(item["market_price_at_news"]))
+        payload["market_price_timestamp"] = item.get("market_price_timestamp")
+        payload["market_price_source"] = item.get("market_price_source") or "alpaca_bars_1min_close"
 
     try:
         # ConditionalExpression ensures we only write once.
@@ -381,11 +555,48 @@ def _process_one_record(record: dict, *, table, trade_executor_arn: str, lambda_
             score = Decimal("1")
         if score < Decimal("-1"):
             score = Decimal("-1")
+        sym_articles = articles_by_symbol.get(sym) or []
+        news_published_at = _representative_published_at(sym_articles)
+        # Capture historical price near the news timestamp for backtesting.
+        # If price fetch fails, keep sentiment pipeline moving and store null price.
+        market_price: Optional[Decimal] = None
+        market_price_fetched_at: Optional[str] = None
+        market_price_source: Optional[str] = None
+        market_price_at_news: Optional[Decimal] = None
+        market_price_timestamp: Optional[str] = None
+        try:
+            if news_published_at:
+                price_info = _fetch_price_at_published_time_with_alpaca(sym, news_published_at)
+                market_price_at_news = price_info["price"]
+                market_price_timestamp = price_info.get("price_timestamp")
+                market_price_source = price_info.get("source")
+                # Keep legacy field populated for compatibility with existing consumers.
+                market_price = market_price_at_news
+                market_price_fetched_at = price_info.get("reference_published_at")
+            else:
+                # Fallback path for messages with missing publishedAt values.
+                price_info = _fetch_latest_price_with_alpaca(sym)
+                market_price = price_info["price"]
+                market_price_fetched_at = price_info.get("fetched_at")
+                market_price_source = price_info.get("source")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to fetch market price for symbol", extra={"run_id": run_id, "symbol": sym})
+
         _put_sentiment_item(
             table=table,
             run_id=run_id,
             symbol=sym,
-            item={"label": label, "score": score, "rationale": item.get("rationale") or ""},
+            item={
+                "label": label,
+                "score": score,
+                "rationale": item.get("rationale") or "",
+                "news_published_at": news_published_at,
+                "market_price_at_news": market_price_at_news,
+                "market_price_timestamp": market_price_timestamp,
+                "market_price": market_price,
+                "market_price_fetched_at": market_price_fetched_at,
+                "market_price_source": market_price_source,
+            },
             source=source,
         )
 

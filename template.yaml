@@ -207,6 +207,8 @@ Resources:
           DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
           TRADE_EXECUTOR_FUNCTION_ARN: !GetAtt TradeExecutorFunction.Arn
           ANTHROPIC_API_KEY: !Sub '{{resolve:secretsmanager:${AnthropicApiSecretId}:SecretString:${AnthropicSecretJsonKey}}}'
+          ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
+          ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
           ANTHROPIC_MODEL: !Ref AnthropicModel
           ARTICLES_PER_SYMBOL_PROMPT: 3
           ARTICLE_TEXT_MAX_CHARS: 500

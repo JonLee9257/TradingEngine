@@ -92,6 +92,26 @@ def install_stubs() -> None:
         anthropic_stub.Anthropic = Anthropic
         sys.modules["anthropic"] = anthropic_stub
 
+    # ---- requests ----
+    if "requests" not in sys.modules:
+        requests_stub = types.ModuleType("requests")
+
+        class _DummyResponse:
+            status_code = 200
+            text = "{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {}
+
+        def get(*_args, **_kwargs):  # pragma: no cover
+            return _DummyResponse()
+
+        requests_stub.get = get
+        sys.modules["requests"] = requests_stub
+
     # ---- alpaca-py ----
     if "alpaca" not in sys.modules:
         alpaca_stub = types.ModuleType("alpaca")

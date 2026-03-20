@@ -68,6 +68,27 @@ class TestSentimentAnalyzer(unittest.TestCase):
         self.assertEqual(written["sentiment_label"], "positive")
         self.assertEqual(written["rationale"], "good news")
 
+    def test_put_sentiment_item_stores_market_price_fields(self):
+        table = DummyTable()
+        self.mod._put_sentiment_item(
+            table=table,
+            run_id="run-1",
+            symbol="TSLA",
+            item={
+                "label": "neutral",
+                "score": 0.0,
+                "rationale": "flat",
+                "market_price": Decimal("250.12"),
+                "market_price_fetched_at": "2026-03-18T12:00:00Z",
+                "market_price_source": "alpaca_latest_trade",
+            },
+            source={"triggered_at": "t", "model": "m", "lambda_request_id": "req-1"},
+        )
+        written = table.last_put_item["Item"]
+        self.assertEqual(written["market_price"], Decimal("250.12"))
+        self.assertEqual(written["market_price_fetched_at"], "2026-03-18T12:00:00Z")
+        self.assertEqual(written["market_price_source"], "alpaca_latest_trade")
+
     def test_analyze_sentiment_uses_structured_parse(self):
         # Patch the Anthropic client used inside the module.
         class DummyMessages:
