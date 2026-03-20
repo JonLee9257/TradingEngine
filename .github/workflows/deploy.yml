@@ -46,5 +46,6 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --resolve-s3 \
-            --capabilities CAPABILITY_IAM
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides BacktestLakeBucketName="trading-backtest-lake-365953917399-us-east-1"
         # Commit samconfig.toml (no secrets in it) or pass --stack-name / --parameter-overrides here.
