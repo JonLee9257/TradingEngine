@@ -3,6 +3,7 @@ import os
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from tests.stub_dependencies import install_stubs
@@ -14,14 +15,6 @@ def load_module_from_path(module_name: str, path: str):
     assert spec and spec.loader
     spec.loader.exec_module(module)
     return module
-
-
-class DummyTable:
-    def __init__(self):
-        self.last_put_item = None
-
-    def put_item(self, *, Item=None, ConditionExpression=None):
-        self.last_put_item = {"Item": Item, "ConditionExpression": ConditionExpression}
 
 
 class DummyParseResp:
@@ -47,31 +40,26 @@ class TestSentimentAnalyzer(unittest.TestCase):
             os.path.join("lambdas", "sentiment_analyzer", "app.py"),
         )
 
-    def test_put_sentiment_item_uses_decimal(self):
-        table = DummyTable()
+    def test_build_sentiment_item_payload_uses_decimal(self):
         run_id = "run-1"
         symbol = "AAPL"
         item = {"label": "positive", "score": 0.2, "rationale": "good news"}
         source = {"triggered_at": "t", "model": "m", "lambda_request_id": "req-1"}
 
-        self.mod._put_sentiment_item(
-            table=table,
+        written = self.mod._build_sentiment_item_payload(
             run_id=run_id,
             symbol=symbol,
             item=item,
             source=source,
         )
 
-        written = table.last_put_item["Item"]
         self.assertIsInstance(written["sentiment_score"], Decimal)
         self.assertEqual(written["sentiment_score"], Decimal(str(item["score"])))
         self.assertEqual(written["sentiment_label"], "positive")
         self.assertEqual(written["rationale"], "good news")
 
-    def test_put_sentiment_item_stores_market_price_fields(self):
-        table = DummyTable()
-        self.mod._put_sentiment_item(
-            table=table,
+    def test_build_sentiment_item_payload_stores_market_price_fields(self):
+        written = self.mod._build_sentiment_item_payload(
             run_id="run-1",
             symbol="TSLA",
             item={
@@ -81,13 +69,30 @@ class TestSentimentAnalyzer(unittest.TestCase):
                 "market_price": Decimal("250.12"),
                 "market_price_fetched_at": "2026-03-18T12:00:00Z",
                 "market_price_source": "alpaca_latest_trade",
+                "market_session": "REGULAR",
+                "is_regular_hours": True,
+                "market_price_lookup_start_at": "2026-03-18T12:00:00Z",
             },
             source={"triggered_at": "t", "model": "m", "lambda_request_id": "req-1"},
         )
-        written = table.last_put_item["Item"]
         self.assertEqual(written["market_price"], Decimal("250.12"))
         self.assertEqual(written["market_price_fetched_at"], "2026-03-18T12:00:00Z")
         self.assertEqual(written["market_price_source"], "alpaca_latest_trade")
+        self.assertEqual(written["market_session"], "REGULAR")
+        self.assertEqual(written["is_regular_hours"], True)
+        self.assertEqual(written["market_price_lookup_start_at"], "2026-03-18T12:00:00Z")
+
+    def test_market_session_classifier(self):
+        # 2026-03-18 14:00 UTC == 10:00 ET (weekday regular session)
+        self.assertEqual(
+            self.mod._market_session_from_timestamp(datetime(2026, 3, 18, 14, 0, tzinfo=timezone.utc)),
+            "REGULAR",
+        )
+        # 2026-03-18 11:00 UTC == 07:00 ET (pre-market)
+        self.assertEqual(
+            self.mod._market_session_from_timestamp(datetime(2026, 3, 18, 11, 0, tzinfo=timezone.utc)),
+            "PRE",
+        )
 
     def test_analyze_sentiment_uses_structured_parse(self):
         # Patch the Anthropic client used inside the module.
