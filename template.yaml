@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless trading system (News -> Sentiment -> Paper Trades)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 60
+    Tracing: Active
+
+Parameters:
+  ScheduleHour:
+    Type: Number
+    Default: 9
+    Description: EventBridge cron hour (UTC by default)
+  ScheduleMinute:
+    Type: Number
+    Default: 30
+    Description: EventBridge cron minute (UTC by default)
+
+  TopSymbols:
+    Type: String
+    Default: AAPL,MSFT,NVDA,AMZN,TSLA,GOOGL,META,AMD,INTC,PLTR
+    Description: Comma-separated list of symbols (first 10 are used)
+
+  NewsApiSecretId:
+    Type: String
+    Description: Secrets Manager secret name/ARN containing NewsAPI key JSON.
+  AnthropicApiSecretId:
+    Type: String
+    Description: Secrets Manager secret name/ARN containing Anthropic key JSON.
+  AnthropicModel:
+    Type: String
+    Default: claude-haiku-4-5-20251001
+  AlpacaApiKeySecretId:
+    Type: String
+    Description: Secrets Manager secret name/ARN containing Alpaca API key JSON.
+  AlpacaSecretKeySecretId:
+    Type: String
+    Description: Secrets Manager secret name/ARN containing Alpaca secret key JSON.
+
+  # JSON key names inside each secret's SecretString.
+  NewsApiSecretJsonKey:
+    Type: String
+    Default: api_key
+  AnthropicSecretJsonKey:
+    Type: String
+    Default: api_key
+  AlpacaApiKeySecretJsonKey:
+    Type: String
+    Default: api_key
+  AlpacaSecretKeySecretJsonKey:
+    Type: String
+    Default: secret_key
+
+  DynamoDbTableName:
+    Type: String
+    Default: TradingNewsSentiment
+
+  ArticlesPerSymbol:
+    Type: Number
+    Default: 3
+  NewsLookbackHours:
+    Type: Number
+    Default: 24
+
+  SentimentBuyThreshold:
+    Type: Number
+    Default: 0.2
+  SentimentSellThreshold:
+    Type: Number
+    Default: -0.2
+  EnableShorts:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+
+  TradeNotionalUsd:
+    Type: Number
+    Default: 1000
+  TradeQty:
+    Type: String
+    Default: ''
+
+  LogLevel:
+    Type: String
+    Default: INFO
+  ForceRefreshToken:
+    Type: String
+    Default: ""
+    Description: Change this value to force Lambda configuration refresh.
+
+Resources:
+  SentimentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SentimentAnalyzerDLQ
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  SentimentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SentimentAnalyzerQueue
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SentimentDLQ.Arn
+        maxReceiveCount: 3
+
+  TradingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDbTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+        - AttributeName: sort_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+        - AttributeName: sort_key
+          KeyType: RANGE
+
+  TradeExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/trade_executor
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
+          ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
+          ALPACA_PAPER: 'true'
+          ENABLE_SHORTS: !Ref EnableShorts
+          SENTIMENT_BUY_THRESHOLD: !Ref SentimentBuyThreshold
+          SENTIMENT_SELL_THRESHOLD: !Ref SentimentSellThreshold
+          TRADE_NOTIONAL_USD: !Ref TradeNotionalUsd
+          TRADE_QTY: !Ref TradeQty
+          LOG_LEVEL: !Ref LogLevel
+          FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTableName
+
+  NewsFetcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/news_fetcher
+      Handler: app.handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref SentimentQueue
+          NEWS_API_KEY: !Sub '{{resolve:secretsmanager:${NewsApiSecretId}:SecretString:${NewsApiSecretJsonKey}}}'
+          TOP_SYMBOLS: !Ref TopSymbols
+          ARTICLES_PER_SYMBOL: !Ref ArticlesPerSymbol
+          NEWS_LOOKBACK_HOURS: !Ref NewsLookbackHours
+          LOG_LEVEL: !Ref LogLevel
+          FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SentimentQueue.QueueName
+      Events:
+        WeekdayNewsSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub 'cron(${ScheduleMinute} ${ScheduleHour} ? * MON-FRI *)'
+
+  SentimentAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/sentiment_analyzer
+      Handler: app.handler
+      Timeout: 330
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          TRADE_EXECUTOR_FUNCTION_ARN: !GetAtt TradeExecutorFunction.Arn
+          ANTHROPIC_API_KEY: !Sub '{{resolve:secretsmanager:${AnthropicApiSecretId}:SecretString:${AnthropicSecretJsonKey}}}'
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+          ARTICLES_PER_SYMBOL_PROMPT: 3
+          ARTICLE_TEXT_MAX_CHARS: 500
+          LOG_LEVEL: !Ref LogLevel
+          FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt SentimentQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTableName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TradeExecutorFunction
+      Events:
+        SentimentQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SentimentQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+
+Outputs:
+  SentimentQueueUrl:
+    Value: !Ref SentimentQueue
+  DynamoDbTableNameOut:
+    Value: !Ref DynamoDbTableName
+  TradeExecutorFunctionArn:
+    Value: !GetAtt TradeExecutorFunction.Arn
+

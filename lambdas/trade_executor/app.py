@@ -1,0 +1,266 @@
+"""
+Lambda 3: Trade Executor
+
+What it does:
+- Receives a `run_id` (invoked by the sentiment analyzer)
+- Looks up all SENTIMENT items for that run in DynamoDB
+- Converts sentiment scores into a trade decision (buy/sell/none)
+- Places paper trades via Alpaca
+- Writes a TRADE record per symbol (idempotently) so retries don't duplicate orders
+"""
+
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from decimal import Decimal
+
+import boto3
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
+from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Attr, Key
+
+
+# Logs go to CloudWatch.
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+try:
+    # Optional local-dev support.
+    from dotenv import load_dotenv
+
+    # For local testing only: load env vars from a `.env` file if present.
+    load_dotenv()
+except Exception:
+    pass
+
+
+def _utc_now_iso() -> str:
+    # Consistent UTC timestamps for DynamoDB records.
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _backoff_sleep(attempt: int) -> None:
+    # Exponential backoff for Alpaca API failures.
+    base = float(os.getenv("ALPACA_BACKOFF_BASE_SECONDS", "0.5"))
+    max_sleep = float(os.getenv("ALPACA_BACKOFF_MAX_SECONDS", "10"))
+    sleep_s = min(max_sleep, base * (2 ** (attempt - 1)))
+    time.sleep(sleep_s)
+
+
+def _get_env_float(name: str, default: float) -> float:
+    # Helper to read float env vars safely.
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _get_trade_client() -> TradingClient:
+    # Create an Alpaca client using API credentials from environment variables.
+    api_key = os.environ["ALPACA_API_KEY"]
+    api_secret = os.environ["ALPACA_SECRET_KEY"]
+    paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+    # `paper=True` means "paper trading" (no real money) when supported by alpaca-py.
+    return TradingClient(api_key=api_key, secret_key=api_secret, paper=paper)
+
+
+def _place_order(*, trading_client: TradingClient, symbol: str, side: OrderSide) -> dict:
+    """
+    Place a market order. Uses either TRADE_QTY or TRADE_NOTIONAL_USD.
+    """
+    max_attempts = int(os.getenv("ALPACA_MAX_ATTEMPTS", "3"))
+    time_in_force = TimeInForce.DAY
+
+    # You can choose trade sizing by either:
+    # - TRADE_QTY (share count)
+    # - TRADE_NOTIONAL_USD (dollar amount)
+    qty_raw = os.getenv("TRADE_QTY")
+    notional_raw = os.getenv("TRADE_NOTIONAL_USD")
+
+    qty = int(qty_raw) if qty_raw not in (None, "") else None
+    notional = float(notional_raw) if notional_raw not in (None, "") else None
+
+    # At least one sizing method must be provided.
+    if qty is None and notional is None:
+        raise ValueError("Set either TRADE_QTY or TRADE_NOTIONAL_USD.")
+
+    last_err: Optional[Exception] = None
+    # Retry order placement if Alpaca errors transiently.
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req_kwargs = {
+                "symbol": symbol,
+                "side": side,
+                "time_in_force": time_in_force,
+            }
+            if qty is not None:
+                req_kwargs["qty"] = qty
+            else:
+                req_kwargs["notional"] = notional
+
+            req = MarketOrderRequest(**req_kwargs)
+            # Submit the order to Alpaca.
+            order = trading_client.submit_order(req)
+            order_id = getattr(order, "id", None) or getattr(order, "order_id", None)
+            order_id_str = str(order_id) if order_id is not None else ""
+
+            return {
+                # DynamoDB can't serialize UUID objects, so store as string.
+                "alpaca_order_id": order_id_str,
+                "submitted_at": _utc_now_iso(),
+            }
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "Alpaca order placement failed",
+                extra={"symbol": symbol, "side": str(side), "attempt": attempt, "max_attempts": max_attempts, "error": str(e)},
+            )
+            if attempt < max_attempts:
+                _backoff_sleep(attempt)
+
+    raise RuntimeError(f"Alpaca order placement failed after {max_attempts} attempts: {last_err}")
+
+
+def _decide_side(
+    *, score: Decimal, buy_threshold: Decimal, sell_threshold: Decimal, enable_shorts: bool
+) -> Optional[OrderSide]:
+    # Convert sentiment score to a trade decision:
+    # - score >= buy_threshold => BUY
+    # - score <= sell_threshold => SELL (only if shorts enabled)
+    # - otherwise => no trade (return None)
+    if score >= buy_threshold:
+        return OrderSide.BUY
+    if score <= sell_threshold:
+        if not enable_shorts:
+            return None
+        return OrderSide.SELL
+    return None
+
+
+def _get_env_decimal(name: str, default: Decimal) -> Decimal:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return Decimal(raw)
+
+
+def handler(event, context):
+    """
+    Invoke with: {"run_id": "..."}.
+    Queries DynamoDB for sentiment results, then executes idempotent paper trades via Alpaca.
+    """
+    # `run_id` tells us which sentiment analysis batch to use.
+    run_id = event.get("run_id")
+    if not run_id:
+        raise ValueError("Missing required input: run_id")
+
+    # DynamoDB table handle.
+    table = boto3.resource("dynamodb").Table(os.environ["DYNAMODB_TABLE_NAME"])
+
+    # Trading thresholds control when to place BUY/SELL orders.
+    buy_threshold = _get_env_decimal("SENTIMENT_BUY_THRESHOLD", Decimal("0.2"))
+    sell_threshold = _get_env_decimal("SENTIMENT_SELL_THRESHOLD", Decimal("-0.2"))
+    enable_shorts = os.getenv("ENABLE_SHORTS", "false").lower() == "true"
+
+    # Create Alpaca API client.
+    trading_client = _get_trade_client()
+
+    # Query only sentiment items for this run_id.
+    # sort_key begins_with("SENTIMENT#")
+    resp = table.query(
+        KeyConditionExpression=Key("run_id").eq(run_id) & Key("sort_key").begins_with("SENTIMENT#"),
+    )
+    items = resp.get("Items") or []
+
+    if not items:
+        logger.warning("No sentiment items found; no trades executed", extra={"run_id": run_id})
+        return {"status": "ok", "run_id": run_id, "trades": 0}
+
+    # Track whether we encountered errors; if yes, we raise so Lambda/SQS retry can happen.
+    had_errors = False
+    trades_submitted = 0
+
+    for it in items:
+        symbol = (it.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        sentiment_score_raw = it.get("sentiment_score") or Decimal("0")
+        if isinstance(sentiment_score_raw, Decimal):
+            sentiment_score = sentiment_score_raw
+        else:
+            sentiment_score = Decimal(str(sentiment_score_raw))
+        side = _decide_side(
+            score=sentiment_score,
+            buy_threshold=buy_threshold,
+            sell_threshold=sell_threshold,
+            enable_shorts=enable_shorts,
+        )
+        if side is None:
+            logger.info("No trade decision for symbol", extra={"run_id": run_id, "symbol": symbol, "score": sentiment_score})
+            continue
+
+        trade_sort_key = f"TRADE#{symbol}"
+
+        # Idempotency: if we've already recorded a trade for this run+symbol, skip.
+        try:
+            existing = table.get_item(Key={"run_id": run_id, "sort_key": trade_sort_key}).get("Item")
+            if existing:
+                logger.info("Trade already recorded; skipping", extra={"run_id": run_id, "symbol": symbol})
+                continue
+        except Exception:  # noqa: BLE001
+            # If we can't read idempotency state, fail fast so SQS/Lambda retries.
+            logger.exception("Failed reading idempotency record", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
+            continue
+
+        logger.info("Submitting paper trade", extra={"run_id": run_id, "symbol": symbol, "side": str(side), "score": sentiment_score})
+
+        try:
+            # Actually place the order with Alpaca.
+            order_result = _place_order(trading_client=trading_client, symbol=symbol, side=side)
+
+            # Store a TRADE record in DynamoDB.
+            # Conditional writes prevent duplicates if the Lambda retries.
+            trade_item = {
+                "run_id": run_id,
+                "sort_key": trade_sort_key,
+                "item_type": "TRADE",
+                "symbol": symbol,
+                # DynamoDB/boto3 requires numbers to be Decimal (floats are not supported).
+                "sentiment_score": Decimal(str(sentiment_score)),
+                "sentiment_label": it.get("sentiment_label") or "neutral",
+                "side": str(side),
+                "alpaca_order_id": order_result.get("alpaca_order_id") or "",
+                "submitted_at": order_result.get("submitted_at"),
+                "trade_attempted_by": getattr(context, "aws_request_id", None),
+            }
+
+            table.put_item(
+                Item=trade_item,
+                ConditionExpression=Attr("sort_key").not_exists(),
+            )
+
+            trades_submitted += 1
+        except ClientError as e:
+            # Conditional write indicates another retry already recorded it; treat as success.
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                logger.info("Trade record written by concurrent run; skipping", extra={"run_id": run_id, "symbol": symbol})
+                continue
+            logger.exception("Failed writing trade record", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
+        except Exception:  # noqa: BLE001
+            logger.exception("Trade execution failed", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
+
+    if had_errors:
+        raise RuntimeError(f"Trade executor had errors for run_id={run_id}")
+
+    # Successful run returns summary for logs/debugging.
+    return {"status": "ok", "run_id": run_id, "trades": trades_submitted}
+

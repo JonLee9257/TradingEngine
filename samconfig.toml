@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "trading-system-paper"
+resolve_s3 = true
+s3_prefix = "trading-system-paper"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "ScheduleHour=\"9\" ScheduleMinute=\"30\" TopSymbols=\"AAPL,MSFT,NVDA,AMZN,TSLA,GOOGL,META,AMD,INTC,PLTR\" AnthropicModel=\"claude-3-5-sonnet-latest\" DynamoDbTableName=\"TradingNewsSentiment\" ArticlesPerSymbol=\"3\" NewsLookbackHours=\"24\" SentimentBuyThreshold=\"0.2\" SentimentSellThreshold=\"-0.2\" EnableShorts=\"false\" TradeNotionalUsd=\"1000\" TradeQty=\"\" LogLevel=\"INFO\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"
