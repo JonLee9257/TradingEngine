@@ -93,6 +93,18 @@ Parameters:
     Default: ""
     Description: Change this value to force Lambda configuration refresh.
 
+  PublishCloudWatchMetrics:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Trade executor publishes Alpaca snapshot numbers as custom CloudWatch metrics.
+  CloudWatchMetricNamespace:
+    Type: String
+    Default: 'Trading/Paper'
+    Description: Namespace for PutMetricData (e.g. Trading/Paper).
+
 Resources:
   SentimentDLQ:
     Type: AWS::SQS::Queue
@@ -146,9 +158,16 @@ Resources:
           TRADE_QTY: !Ref TradeQty
           LOG_LEVEL: !Ref LogLevel
           FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+          PUBLISH_CLOUDWATCH_METRICS: !Ref PublishCloudWatchMetrics
+          CLOUDWATCH_METRIC_NAMESPACE: !Ref CloudWatchMetricNamespace
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DynamoDbTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
 
   NewsFetcherFunction:
     Type: AWS::Serverless::Function

@@ -121,6 +121,17 @@ sam deploy \
   - Sentiment items use conditional writes (`attribute_not_exists`) to avoid duplicates.
   - Trade execution writes `TRADE#<symbol>` records conditionally; if a trade record already exists, the executor skips it.
 
+## CloudWatch P&L metrics (trade executor)
+
+After each successful `trade_executor` run, the Lambda logs an **Alpaca account snapshot** and (by default) calls **`PutMetricData`** so you can chart P&L in a dashboard.
+
+- **Namespace:** `Trading/Paper` (override with SAM parameter `CloudWatchMetricNamespace`).
+- **Metric names:** PascalCase from the snapshot, e.g. `EquityUsd`, `DayPlUsd`, `DayPlPct`, `UnrealizedPlUsd`, `AccountStatusCode`.
+- **Dimension:** `PaperTrading` = `true` or `false` (from `ALPACA_PAPER`).
+- **Disable publishing:** deploy with `PublishCloudWatchMetrics=false` (metrics still appear in logs as structured fields).
+
+**Add a dashboard widget:** CloudWatch → Dashboards → Add widget → Line → Metrics → Custom namespaces → choose your namespace → select metrics (e.g. `EquityUsd`, `DayPlPct`).
+
 ## Paper Trading Notes
 
 - This uses Alpaca “paper trading” by default (`ALPACA_PAPER=true` in the SAM template).
