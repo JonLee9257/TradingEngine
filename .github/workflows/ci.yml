@@ -1,0 +1,31 @@
+# Build and test on every push / PR — no AWS deploy, no secrets required.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: SAM validate
+        run: sam validate --lint
+
+      - name: SAM build
+        run: sam build
+
+      - name: Unit tests
+        run: python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py

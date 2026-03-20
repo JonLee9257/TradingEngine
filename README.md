@@ -152,6 +152,26 @@ cp .env.example .env
 
 SAM local can load environment variables depending on how you invoke it; the Lambdas also attempt a best-effort `.env` load when `python-dotenv` is installed.
 
+## GitHub Actions (CI / deploy)
+
+Two workflows live under `.github/workflows/`:
+
+| Workflow | When it runs | What it does |
+|----------|----------------|---------------|
+| **CI** (`ci.yml`) | Every push / PR to `main` or `master` | `sam validate`, `sam build`, unit tests — **no AWS credentials** needed. |
+| **Deploy** (`deploy.yml`) | **Actions → Deploy → Run workflow** (manual) | `sam build` + `sam deploy` using AWS keys from repo **Secrets**. |
+
+### One-time setup for deploy
+
+1. In GitHub: **Settings → Secrets and variables → Actions → New repository secret**
+   - `AWS_ACCESS_KEY_ID`
+   - `AWS_SECRET_ACCESS_KEY`
+2. Optional: **Settings → Variables → Actions** → add `AWS_REGION` (e.g. `us-east-1`). If omitted, deploy uses `us-east-1`.
+3. **Commit `samconfig.toml`** from your machine (after `sam deploy --guided`) so CI/CD can deploy non-interactively — it should **not** contain API keys (those stay in Secrets Manager per this template). Or hard-code `--stack-name` and `--parameter-overrides` in `deploy.yml`.
+4. To deploy on every merge to `main`, edit `deploy.yml` and add a `push:` trigger (see comments in that file).
+
+For **OIDC** (no long-lived access keys), use IAM role + `aws-actions/configure-aws-credentials` with `role-to-assume` instead of access keys — see [AWS’s GitHub OIDC guide](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services).
+
 ## Tests (unit)
 
 These are lightweight unit tests that mock external services (no NewsAPI/Anthropic/Alpaca calls).
