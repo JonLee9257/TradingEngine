@@ -111,6 +111,11 @@ def install_stubs() -> None:
         class TimeInForce:
             DAY = "DAY"
 
+        class AccountStatus:
+            ACTIVE = "ACTIVE"
+            PAPER_ONLY = "PAPER_ONLY"
+            DISABLED = "DISABLED"
+
         class MarketOrderRequest:  # pragma: no cover
             def __init__(self, *args, **kwargs):
                 pass
@@ -118,6 +123,7 @@ def install_stubs() -> None:
         client_stub.TradingClient = TradingClient
         enums_stub.OrderSide = OrderSide
         enums_stub.TimeInForce = TimeInForce
+        enums_stub.AccountStatus = AccountStatus
         requests_stub.MarketOrderRequest = MarketOrderRequest
 
         sys.modules["alpaca"] = alpaca_stub

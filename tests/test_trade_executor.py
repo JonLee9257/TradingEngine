@@ -56,10 +56,16 @@ class TestTradeExecutor(unittest.TestCase):
 
         self.mod.boto3.resource = lambda _svc: DummyResource()  # type: ignore[attr-defined]
 
-        # Avoid Alpaca calls: patch the trade client + order placement.
+        # Avoid Alpaca calls: patch the trade client + order placement + P&L snapshot.
         self.mod._get_trade_client = lambda: object()  # type: ignore[attr-defined]
         self.mod._place_order = lambda **_kwargs: {"alpaca_order_id": "order-1", "submitted_at": "now"}  # type: ignore[attr-defined]
         self.mod._decide_side = lambda **_kwargs: "BUY"  # type: ignore[attr-defined]
+        self.mod._account_pnl_snapshot = lambda _tc: {  # type: ignore[attr-defined]
+            "equity_usd": 100_000.0,
+            "account_status_code": 2.0,
+            "account_status": "PAPER_ONLY",
+        }
+        self.mod._publish_trading_metrics = lambda *_a, **_k: None  # type: ignore[attr-defined]
 
         # Environment variables used by handler thresholds/sizing.
         os.environ["DYNAMODB_TABLE_NAME"] = "TradingNewsSentiment"
@@ -76,6 +82,8 @@ class TestTradeExecutor(unittest.TestCase):
 
         resp = self.mod.handler(event, context)
         self.assertEqual(resp["status"], "ok")
+        self.assertIn("account_snapshot", resp)
+        self.assertEqual(resp["account_snapshot"]["equity_usd"], 100_000.0)
         self.assertGreaterEqual(len(dummy_table.put_calls), 1)
 
         written_item = dummy_table.put_calls[-1]["Item"]

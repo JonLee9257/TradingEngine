@@ -9,7 +9,6 @@ What it does:
 - Writes a TRADE record per symbol (idempotently) so retries don't duplicate orders
 """
 
-import json
 import logging
 import os
 import time
@@ -20,7 +19,7 @@ from decimal import Decimal
 
 import boto3
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import AccountStatus, OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr, Key
@@ -41,12 +40,12 @@ except Exception:
 
 
 def _utc_now_iso() -> str:
-    # Consistent UTC timestamps for DynamoDB records.
+    """Return current UTC time as ISO 8601 string for DynamoDB records."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _backoff_sleep(attempt: int) -> None:
-    # Exponential backoff for Alpaca API failures.
+    """Sleep with exponential backoff between Alpaca API retries."""
     base = float(os.getenv("ALPACA_BACKOFF_BASE_SECONDS", "0.5"))
     max_sleep = float(os.getenv("ALPACA_BACKOFF_MAX_SECONDS", "10"))
     sleep_s = min(max_sleep, base * (2 ** (attempt - 1)))
@@ -54,7 +53,7 @@ def _backoff_sleep(attempt: int) -> None:
 
 
 def _get_env_float(name: str, default: float) -> float:
-    # Helper to read float env vars safely.
+    """Read a float from environment variables, returning default if missing or invalid."""
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
@@ -62,12 +61,189 @@ def _get_env_float(name: str, default: float) -> float:
 
 
 def _get_trade_client() -> TradingClient:
-    # Create an Alpaca client using API credentials from environment variables.
+    """Create an Alpaca TradingClient using API credentials from environment variables."""
     api_key = os.environ["ALPACA_API_KEY"]
     api_secret = os.environ["ALPACA_SECRET_KEY"]
     paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
     # `paper=True` means "paper trading" (no real money) when supported by alpaca-py.
     return TradingClient(api_key=api_key, secret_key=api_secret, paper=paper)
+
+
+def _parse_money_field(value: object) -> Optional[float]:
+    """Alpaca returns many money fields as strings; normalize to float for math/logging."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _account_status_code(status: object) -> float:
+    """
+    Map Alpaca account status to a number for CloudWatch metrics (no string metric values).
+
+    Rough scale: 0 = blocked/closed, 1 = active trading, 2 = paper-only, 5 = onboarding/pending.
+    """
+    if status is None:
+        return 0.0
+    if isinstance(status, AccountStatus):
+        key = status.value
+    else:
+        key = str(status).strip().upper()
+        if "." in key:
+            key = key.split(".")[-1]
+
+    terminal_bad = frozenset(
+        {
+            "DISABLED",
+            "ACCOUNT_CLOSED",
+            "REJECTED",
+            "INACTIVE",
+            "SUBMISSION_FAILED",
+        }
+    )
+    if key in terminal_bad:
+        return 0.0
+    if key in ("ACTIVE", "APPROVED"):
+        return 1.0
+    if key == "PAPER_ONLY":
+        return 2.0
+    return 5.0
+
+
+def _sum_positions_unrealized_pl(trading_client: TradingClient) -> Optional[float]:
+    """Aggregate open-position unrealized P&L (Alpaca exposes PL per position, not on TradeAccount)."""
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception:  # noqa: BLE001
+        return None
+    total = 0.0
+    for pos in positions:
+        pl = _parse_money_field(getattr(pos, "unrealized_pl", None))
+        if pl is not None:
+            total += pl
+    return total
+
+
+def _account_pnl_snapshot(trading_client: TradingClient) -> dict:
+    """
+    Read Alpaca account + positions for P&L / exposure (logs + future CloudWatch custom metrics).
+
+    Numbers-only fields are safe for PutMetricData. `account_status` is a string for logs/JSON only.
+    """
+    account = trading_client.get_account()
+    equity = _parse_money_field(getattr(account, "equity", None))
+    last_equity = _parse_money_field(getattr(account, "last_equity", None))
+    day_pl: Optional[float] = None
+    if equity is not None and last_equity is not None:
+        day_pl = equity - last_equity
+
+    day_pl_pct: Optional[float] = None
+    if day_pl is not None and last_equity is not None and abs(last_equity) > 1e-9:
+        day_pl_pct = (day_pl / last_equity) * 100.0
+
+    # API may include these on account; SDK model might omit them — use getattr.
+    realized_pl = _parse_money_field(getattr(account, "realized_pl", None))
+    account_unrealized = _parse_money_field(getattr(account, "unrealized_pl", None))
+    positions_unrealized = _sum_positions_unrealized_pl(trading_client)
+    unrealized_pl = account_unrealized if account_unrealized is not None else positions_unrealized
+
+    raw_status = getattr(account, "status", None)
+    status_str = raw_status.value if isinstance(raw_status, AccountStatus) else str(raw_status or "")
+
+    return {
+        "equity_usd": equity,
+        "last_equity_usd": last_equity,
+        "day_pl_usd": day_pl,
+        "day_pl_pct": day_pl_pct,
+        "realized_pl_usd": realized_pl,
+        "unrealized_pl_usd": unrealized_pl,
+        "cash_usd": _parse_money_field(getattr(account, "cash", None)),
+        "long_market_value_usd": _parse_money_field(getattr(account, "long_market_value", None)),
+        "short_market_value_usd": _parse_money_field(getattr(account, "short_market_value", None)),
+        "buying_power_usd": _parse_money_field(getattr(account, "buying_power", None)),
+        "initial_margin_usd": _parse_money_field(getattr(account, "initial_margin", None)),
+        "maintenance_margin_usd": _parse_money_field(getattr(account, "maintenance_margin", None)),
+        "account_status_code": _account_status_code(raw_status),
+        "account_status": status_str,
+    }
+
+
+def _snapshot_key_to_metric_name(key: str) -> str:
+    """CloudWatch metric names: EquityUsd, DayPlPct, ... (from equity_usd, day_pl_pct)."""
+    return "".join(part.capitalize() for part in key.split("_"))
+
+
+def _metric_unit_for_snapshot_key(key: str) -> str:
+    if key == "day_pl_pct":
+        return "Percent"
+    return "None"
+
+
+def _publish_trading_metrics(snap: dict, *, run_id: str) -> None:
+    """
+    Emit numeric snapshot fields as custom CloudWatch metrics (for dashboards / alarms).
+
+    Skips `account_status` (string). Failures are logged only — trading must not depend on CW.
+    """
+    raw = os.getenv("PUBLISH_CLOUDWATCH_METRICS", "true").lower()
+    if raw in ("0", "false", "no", "off"):
+        return
+
+    namespace = os.getenv("CLOUDWATCH_METRIC_NAMESPACE", "Trading/Paper").strip() or "Trading/Paper"
+
+    dimensions = [
+        {
+            "Name": "PaperTrading",
+            "Value": "true" if os.getenv("ALPACA_PAPER", "true").lower() == "true" else "false",
+        },
+    ]
+
+    metric_data: list[dict] = []
+    for key, val in snap.items():
+        if key == "account_status":
+            continue
+        if val is None or isinstance(val, bool):
+            continue
+        if not isinstance(val, (int, float)):
+            continue
+        metric_data.append(
+            {
+                "MetricName": _snapshot_key_to_metric_name(key),
+                "Dimensions": dimensions,
+                "Value": float(val),
+                "Unit": _metric_unit_for_snapshot_key(key),
+            }
+        )
+
+    if not metric_data:
+        return
+
+    try:
+        boto3.client("cloudwatch").put_metric_data(Namespace=namespace, MetricData=metric_data)
+        logger.debug(
+            "Published trading metrics to CloudWatch",
+            extra={"run_id": run_id, "namespace": namespace, "count": len(metric_data)},
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to publish trading metrics to CloudWatch",
+            extra={"run_id": run_id, "namespace": namespace},
+            exc_info=True,
+        )
+
+
+def _snapshot_and_publish_telemetry(trading_client: TradingClient, run_id: str) -> Optional[dict]:
+    """Fetch Alpaca snapshot, log it, publish CloudWatch metrics; returns None on Alpaca failure."""
+    try:
+        snap = _account_pnl_snapshot(trading_client)
+        logger.info("Alpaca account P&L snapshot", extra={"run_id": run_id, **snap})
+        _publish_trading_metrics(snap, run_id=run_id)
+        return snap
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to fetch Alpaca account snapshot", extra={"run_id": run_id})
+        return None
 
 
 def _place_order(*, trading_client: TradingClient, symbol: str, side: OrderSide) -> dict:
@@ -130,10 +306,11 @@ def _place_order(*, trading_client: TradingClient, symbol: str, side: OrderSide)
 def _decide_side(
     *, score: Decimal, buy_threshold: Decimal, sell_threshold: Decimal, enable_shorts: bool
 ) -> Optional[OrderSide]:
-    # Convert sentiment score to a trade decision:
-    # - score >= buy_threshold => BUY
-    # - score <= sell_threshold => SELL (only if shorts enabled)
-    # - otherwise => no trade (return None)
+    """
+    Convert sentiment score to a trade decision.
+    Returns BUY if score >= buy_threshold, SELL if score <= sell_threshold (when shorts enabled),
+    or None for no trade.
+    """
     if score >= buy_threshold:
         return OrderSide.BUY
     if score <= sell_threshold:
@@ -144,6 +321,7 @@ def _decide_side(
 
 
 def _get_env_decimal(name: str, default: Decimal) -> Decimal:
+    """Read a Decimal from environment variables, returning default if missing or invalid."""
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
@@ -180,7 +358,8 @@ def handler(event, context):
 
     if not items:
         logger.warning("No sentiment items found; no trades executed", extra={"run_id": run_id})
-        return {"status": "ok", "run_id": run_id, "trades": 0}
+        snap_none = _snapshot_and_publish_telemetry(trading_client, run_id)
+        return {"status": "ok", "run_id": run_id, "trades": 0, "account_snapshot": snap_none}
 
     # Track whether we encountered errors; if yes, we raise so Lambda/SQS retry can happen.
     had_errors = False
@@ -261,6 +440,12 @@ def handler(event, context):
     if had_errors:
         raise RuntimeError(f"Trade executor had errors for run_id={run_id}")
 
-    # Successful run returns summary for logs/debugging.
-    return {"status": "ok", "run_id": run_id, "trades": trades_submitted}
+    snap_done = _snapshot_and_publish_telemetry(trading_client, run_id)
+
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "trades": trades_submitted,
+        "account_snapshot": snap_done,
+    }
 
