@@ -1,0 +1,31 @@
+{
+  "family": "trading-backtester",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/trading-backtester-task-role",
+  "containerDefinitions": [
+    {
+      "name": "backtester",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/trading-backtester:latest",
+      "essential": true,
+      "environment": [
+        { "name": "DYNAMODB_TABLE_NAME", "value": "TradingNewsSentiment" },
+        { "name": "S3_PARQUET_PATH", "value": "s3://<BUCKET>/sentiment-buffered/" },
+        { "name": "S3_BARS_CACHE_PREFIX", "value": "s3://<BUCKET>/bars-cache" },
+        { "name": "BACKTEST_SYMBOL", "value": "TSLA" },
+        { "name": "BACKTEST_MIN_SHARPE_IMPROVEMENT", "value": "0.10" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/trading-backtester",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
