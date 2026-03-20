@@ -25,7 +25,7 @@ jobs:
         run: sam validate --lint
 
       - name: SAM build
-        run: sam build
+        run: sam build --use-container
 
       - name: Unit tests
         run: python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py
