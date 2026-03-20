@@ -92,6 +92,41 @@ def install_stubs() -> None:
         anthropic_stub.Anthropic = Anthropic
         sys.modules["anthropic"] = anthropic_stub
 
+    # ---- requests ----
+    if "requests" not in sys.modules:
+        requests_stub = types.ModuleType("requests")
+
+        class _DummyResponse:
+            status_code = 200
+            text = "{}"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {}
+
+        def get(*_args, **_kwargs):  # pragma: no cover
+            return _DummyResponse()
+
+        requests_stub.get = get
+        sys.modules["requests"] = requests_stub
+
+    # ---- pytz ----
+    if "pytz" not in sys.modules:
+        pytz_stub = types.ModuleType("pytz")
+
+        def timezone(_name: str):  # pragma: no cover
+            from datetime import timedelta, timezone as _tz
+
+            # Minimal stub sufficient for astimezone() in unit tests.
+            if _name == "America/New_York":
+                return _tz(timedelta(hours=-4))
+            return _tz.utc
+
+        pytz_stub.timezone = timezone
+        sys.modules["pytz"] = pytz_stub
+
     # ---- alpaca-py ----
     if "alpaca" not in sys.modules:
         alpaca_stub = types.ModuleType("alpaca")

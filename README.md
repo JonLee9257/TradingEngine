@@ -5,15 +5,21 @@ This project implements the requested pipeline using AWS serverless components a
 Architecture:
 1. EventBridge cron triggers `news_fetcher` on weekdays at `09:30` (UTC by default).
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
-3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results in DynamoDB.
+3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results + backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
 5. `trade_executor` reads the sentiment for the given `run_id` from DynamoDB and places paper trades via Alpaca (idempotent per symbol per run).
+6. DynamoDB Streams triggers `sentiment_to_s3_parquet`, which appends new `SENTIMENT` rows into an S3 Parquet lake.
+7. A weekly EventBridge Scheduler job runs an ECS Fargate VectorBT backtest task to evaluate threshold quality.
 
 ## Repo Layout
 
 - `lambdas/news_fetcher/` (NewsAPI -> SQS)
-- `lambdas/sentiment_analyzer/` (SQS -> Claude sentiment -> DynamoDB -> invoke trade executor)
-- `lambdas/trade_executor/` (DynamoDB -> Alpaca paper trades)
+- `lambdas/sentiment_analyzer/` (SQS -> Claude sentiment + historical price context -> DynamoDB -> invoke trade executor)
+- `lambdas/trade_executor/` (DynamoDB sentiment + strategy config -> Alpaca paper trades)
+- `lambdas/sentiment_to_s3_parquet/` (DynamoDB stream -> S3 Parquet sink via awswrangler)
+- `analysis/backtest_report.py` (scan SENTIMENT data + forward returns report)
+- `scripts/dynamodb_native_export.py` (enable PITR + start native export to S3)
+- `backtester/` (Dockerized VectorBT engine + ECS task definition template)
 - `template.yaml` (AWS SAM IaC)
 - `.env.example` (local environment variable template)
 
@@ -57,6 +63,12 @@ Then pass these secret names/ARNs as SAM parameters:
 - `AlpacaSecretKeySecretId`
 
 Non-secret defaults (thresholds, schedule time, symbol list, etc.) are parameters in `template.yaml` and can be overridden.
+
+Additional parameters for backtesting pipeline:
+- `BacktestLakeBucketName` (S3 bucket for Parquet lake and exports)
+- `BacktestLakePrefix` (S3 prefix for buffered parquet data)
+- `BacktestEcrImageUri` (ECR image URI for Fargate backtester)
+- `BacktestSymbol` (symbol used by scheduled threshold optimization)
 
 EventBridge schedule:
 - The cron expression uses UTC by default.
@@ -110,6 +122,41 @@ sam deploy \
     ForceRefreshToken="2026-03-19T20:10:00Z"
 ```
 
+## Sentiment Data Model
+
+`sentiment_analyzer` stores one `SENTIMENT#<symbol>` item per symbol/run with fields for backtesting:
+
+- Core sentiment: `sentiment_label`, `sentiment_score`, `rationale`
+- Timing: `news_published_at`, `market_price_timestamp`, `analyzed_at`, `triggered_at`
+- Price context: `market_price_at_news`, `market_session`, `is_regular_hours`, `market_price_lookup_start_at`
+
+Market-session handling:
+
+- If `publishedAt` is in regular hours (09:30-16:00 ET), price lookup starts at that timestamp.
+- If `publishedAt` is outside regular hours, lookup shifts to the next regular open (09:30 ET on next trading weekday).
+- `sentiment_analyzer` first tries Alpaca market calendar (`/v2/calendar`) to handle holidays/closures; if unavailable, it falls back to weekday-only next-open logic.
+
+## Strategy-Based Trading
+
+`trade_executor` checks strategy config before placing orders.
+
+Expected strategy item in DynamoDB:
+
+- PK (`run_id`): `STRATEGY#<SYMBOL>`
+- SK (`sort_key`): `LATEST`
+- Fields:
+  - `is_active` (Boolean)
+  - `optimized_threshold` (Decimal)
+
+Trading rule:
+
+- Only trade when:
+  - `is_active == true`, and
+  - `sentiment_score >= optimized_threshold`
+- If `TradeOnlyAtClose=true`, trading is additionally allowed only in the final `CloseWindowMinutes` of regular session (default: 5 minutes before close).
+
+If strategy config is missing, defaults are conservative (`is_active=false`, threshold=`1.0`), so no accidental trade.
+
 ## How retries & safety work
 
 - SQS queue uses a DLQ with `maxReceiveCount: 3`.
@@ -118,7 +165,7 @@ sam deploy \
   - Claude (sentiment_analyzer)
   - Alpaca (trade_executor)
 - DynamoDB writes are idempotent per `run_id` and symbol:
-  - Sentiment items use conditional writes (`attribute_not_exists`) to avoid duplicates.
+  - Sentiment items use `batch_writer(overwrite_by_pkeys=["run_id","sort_key"])` for throughput and deterministic upsert on retries.
   - Trade execution writes `TRADE#<symbol>` records conditionally; if a trade record already exists, the executor skips it.
 
 ## CloudWatch P&L metrics (trade executor)
@@ -139,6 +186,80 @@ After each successful `trade_executor` run, the Lambda logs an **Alpaca account 
 - Trade sizing uses either:
   - `TRADE_NOTIONAL_USD`, or
   - `TRADE_QTY` (leave `TradeQty` empty to use notional).
+- Close-only execution controls:
+  - `TradeOnlyAtClose` (default: `true`)
+  - `CloseWindowMinutes` (default: `5`)
+
+## Optional Real-Time Rule (disabled)
+
+`template.yaml` includes an optional `RealTimeTradingRule` (`rate(1 minute)`), currently:
+
+- `State: DISABLED`
+
+Enable only when you intentionally want near-real-time triggering.
+
+## DynamoDB -> S3 Data Lake
+
+`template.yaml` now enables:
+- DynamoDB PITR (`TradingTable`)
+- DynamoDB stream (`NEW_IMAGE`)
+- `SentimentToS3ParquetFunction` stream consumer
+
+The stream consumer writes appended parquet files partitioned by date under:
+- `s3://<BacktestLakeBucketName>/<BacktestLakePrefix>/`
+
+## Native DynamoDB Export (on-demand)
+
+Use the script to enable PITR and trigger a native export:
+
+```bash
+python3 scripts/dynamodb_native_export.py \
+  --table-name TradingNewsSentiment \
+  --s3-bucket <your-lake-bucket> \
+  --s3-prefix dynamodb-exports/tradingnews
+```
+
+Notes:
+- Native export format is DynamoDB JSON.
+- `backtester/backtest_engine.py` supports this format via `S3_DDB_EXPORT_PREFIX`.
+
+## Weekly Fargate Backtester
+
+Infra added in `template.yaml`:
+- ECS cluster: `BacktestCluster`
+- Task definition: `BacktestTaskDefinition` (`2 vCPU`, `4GB`)
+- Scheduler: `WeeklyBacktestSchedule` (`Sunday 23:00 UTC`, `FlexibleTimeWindow: OFF`)
+
+The schedule target uses `ecs:RunTask` and requires real VPC IDs. Replace placeholders before deploy:
+- `subnet-CHANGE_ME_A`, `subnet-CHANGE_ME_B`, `sg-CHANGE_ME`
+
+### Build and push image (example)
+
+```bash
+docker build -f backtester/Dockerfile -t trading-backtester:latest .
+# tag + push to ECR, then set BacktestEcrImageUri in sam deploy
+```
+
+### Backtester inputs
+
+`backtester/backtest_engine.py` accepts either:
+- `S3_PARQUET_PATH` (preferred, parquet dataset), or
+- `S3_DDB_EXPORT_PREFIX` (native export path; unmarshalled in code)
+
+For historical bars reuse, set:
+- `S3_BARS_CACHE_PREFIX` (example: `s3://<BacktestLakeBucketName>/bars-cache`)
+
+Default in SAM task definition:
+- `S3_BARS_CACHE_PREFIX=s3://<BacktestLakeBucketName>/bars-cache`
+
+Cache behavior:
+- The backtester checks weekly symbol bars parquet in S3 first.
+- On cache miss, it fetches bars from Alpaca, writes parquet to S3 cache, and reuses it on future runs.
+
+It writes candidate results to DynamoDB as:
+- `run_id=BACKTEST#<SYMBOL>`
+- `sort_key=<UTC timestamp>`
+- `item_type=BACKTEST`
 
 ## Local Development (optional)
 
@@ -208,5 +329,23 @@ Run:
 
 ```bash
 python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py
+```
+
+## Backtest Helper Script
+
+`analysis/backtest_report.py` helps with threshold research:
+
+- scans DynamoDB `item_type=SENTIMENT`
+- reads `sentiment_score` + `market_price_at_news`
+- fetches Alpaca closes at `+15m` and `+60m`
+- prints average return by sentiment-score bucket
+
+Run:
+
+```bash
+export DYNAMODB_TABLE_NAME=TradingNewsSentiment
+export ALPACA_API_KEY=...
+export ALPACA_SECRET_KEY=...
+python3 analysis/backtest_report.py
 ```
 

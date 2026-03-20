@@ -22,7 +22,13 @@ class DummyTable:
     def query(self, **_kwargs):
         return {"Items": self._items}
 
-    def get_item(self, **_kwargs):
+    def get_item(self, **kwargs):
+        key = kwargs.get("Key") or {}
+        run_id = key.get("run_id", "")
+        sort_key = key.get("sort_key", "")
+        # Strategy config lookup
+        if str(run_id).startswith("STRATEGY#") and sort_key == "LATEST":
+            return {"Item": {"is_active": True, "optimized_threshold": Decimal("0.3")}}
         # No existing trade record
         return {}
 
@@ -74,6 +80,7 @@ class TestTradeExecutor(unittest.TestCase):
         os.environ["ENABLE_SHORTS"] = "false"
         os.environ["TRADE_NOTIONAL_USD"] = "1000"
         os.environ["TRADE_QTY"] = ""
+        os.environ["TRADE_ONLY_AT_CLOSE"] = "false"
         os.environ["LOG_LEVEL"] = "INFO"
 
         # Minimal event/context.

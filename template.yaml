@@ -85,6 +85,15 @@ Parameters:
   TradeQty:
     Type: String
     Default: ''
+  TradeOnlyAtClose:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  CloseWindowMinutes:
+    Type: Number
+    Default: 5
 
   LogLevel:
     Type: String
@@ -105,6 +114,21 @@ Parameters:
     Type: String
     Default: 'Trading/Paper'
     Description: Namespace for PutMetricData (e.g. Trading/Paper).
+  BacktestLakeBucketName:
+    Type: String
+    Description: S3 bucket for DynamoDB exports and buffered parquet sentiment data.
+  BacktestLakePrefix:
+    Type: String
+    Default: sentiment-buffered
+    Description: S3 prefix for buffered parquet dataset.
+  BacktestEcrImageUri:
+    Type: String
+    Default: ''
+    Description: ECR image URI for the vectorbt backtester container.
+  BacktestSymbol:
+    Type: String
+    Default: TSLA
+    Description: Symbol used by weekly threshold optimization task.
 
 Resources:
   SentimentDLQ:
@@ -127,6 +151,10 @@ Resources:
     Properties:
       TableName: !Ref DynamoDbTableName
       BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
       AttributeDefinitions:
         - AttributeName: run_id
           AttributeType: S
@@ -149,6 +177,7 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
           ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
           ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
           ALPACA_PAPER: 'true'
@@ -157,6 +186,8 @@ Resources:
           SENTIMENT_SELL_THRESHOLD: !Ref SentimentSellThreshold
           TRADE_NOTIONAL_USD: !Ref TradeNotionalUsd
           TRADE_QTY: !Ref TradeQty
+          TRADE_ONLY_AT_CLOSE: !Ref TradeOnlyAtClose
+          CLOSE_WINDOW_MINUTES: !Ref CloseWindowMinutes
           LOG_LEVEL: !Ref LogLevel
           FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
           PUBLISH_CLOUDWATCH_METRICS: !Ref PublishCloudWatchMetrics
@@ -205,8 +236,11 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
           TRADE_EXECUTOR_FUNCTION_ARN: !GetAtt TradeExecutorFunction.Arn
           ANTHROPIC_API_KEY: !Sub '{{resolve:secretsmanager:${AnthropicApiSecretId}:SecretString:${AnthropicSecretJsonKey}}}'
+          ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
+          ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
           ANTHROPIC_MODEL: !Ref AnthropicModel
           ARTICLES_PER_SYMBOL_PROMPT: 3
           ARTICLE_TEXT_MAX_CHARS: 500
@@ -227,6 +261,201 @@ Resources:
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
 
+  RealTimeTradingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RealTimeTradingRule
+      Description: Optional 1-minute trigger for news fetcher (disabled by default).
+      ScheduleExpression: rate(1 minute)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt NewsFetcherFunction.Arn
+          Id: NewsFetcherFunctionTarget
+
+  AllowEventBridgeInvokeNewsFetcher:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NewsFetcherFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RealTimeTradingRule.Arn
+
+  SentimentToS3ParquetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/sentiment_to_s3_parquet
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_LAKE_BUCKET: !Ref BacktestLakeBucketName
+          S3_LAKE_PREFIX: !Ref BacktestLakePrefix
+          LOG_LEVEL: !Ref LogLevel
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource:
+                - !Sub arn:aws:s3:::${BacktestLakeBucketName}
+                - !Sub arn:aws:s3:::${BacktestLakeBucketName}/*
+            - Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:CreateTable
+                - glue:UpdateTable
+                - glue:GetPartitions
+                - glue:BatchCreatePartition
+              Resource: '*'
+      Events:
+        TradingTableStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TradingTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 50
+            MaximumBatchingWindowInSeconds: 10
+
+  BacktestCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: trading-backtest-cluster
+
+  BacktestTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  BacktestTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BacktestDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${BacktestLakeBucketName}
+                  - !Sub arn:aws:s3:::${BacktestLakeBucketName}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt TradingTable.Arn
+
+  BacktestTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: trading-backtester
+      Cpu: '2048'
+      Memory: '4096'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt BacktestTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt BacktestTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backtester
+          Image: !Ref BacktestEcrImageUri
+          Essential: true
+          Environment:
+            - Name: DYNAMODB_TABLE_NAME
+              Value: !Ref DynamoDbTableName
+            - Name: S3_PARQUET_PATH
+              Value: !Sub s3://${BacktestLakeBucketName}/${BacktestLakePrefix}/
+            - Name: S3_BARS_CACHE_PREFIX
+              Value: !Sub s3://${BacktestLakeBucketName}/bars-cache
+            - Name: BACKTEST_SYMBOL
+              Value: !Ref BacktestSymbol
+            - Name: BACKTEST_MIN_SHARPE_IMPROVEMENT
+              Value: '0.1'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/trading-backtester
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  BacktestSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunBacktestTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Ref BacktestTaskDefinition
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt BacktestTaskExecutionRole.Arn
+                  - !GetAtt BacktestTaskRole.Arn
+
+  WeeklyBacktestSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: weekly-vectorbt-backtest
+      Description: Run vectorbt threshold optimization every Sunday 23:00 UTC.
+      ScheduleExpression: cron(0 23 ? * SUN *)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ecs:runTask
+        RoleArn: !GetAtt BacktestSchedulerRole.Arn
+        Input: !Sub >
+          {
+            "Cluster": "${BacktestCluster.Arn}",
+            "TaskDefinition": "${BacktestTaskDefinition}",
+            "LaunchType": "FARGATE",
+            "NetworkConfiguration": {
+              "awsvpcConfiguration": {
+                "AssignPublicIp": "ENABLED",
+                "Subnets": ["subnet-CHANGE_ME_A", "subnet-CHANGE_ME_B"],
+                "SecurityGroups": ["sg-CHANGE_ME"]
+              }
+            }
+          }
+
 Outputs:
   SentimentQueueUrl:
     Value: !Ref SentimentQueue
@@ -234,4 +463,6 @@ Outputs:
     Value: !Ref DynamoDbTableName
   TradeExecutorFunctionArn:
     Value: !GetAtt TradeExecutorFunction.Arn
+  BacktestTaskDefinitionArn:
+    Value: !Ref BacktestTaskDefinition
 
