@@ -129,6 +129,17 @@ Parameters:
     Type: String
     Default: TSLA
     Description: Symbol used by weekly threshold optimization task.
+  EnableSentimentParquetSink:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable DynamoDB stream -> S3 parquet sink Lambda (disabled by default to avoid large package deploy failures).
+
+Conditions:
+  HasBacktestEcrImageUri: !Not [!Equals [!Ref BacktestEcrImageUri, ""]]
+  EnableSentimentParquetSinkCondition: !Equals [!Ref EnableSentimentParquetSink, 'true']
 
 Resources:
   SentimentDLQ:
@@ -282,6 +293,7 @@ Resources:
 
   SentimentToS3ParquetFunction:
     Type: AWS::Serverless::Function
+    Condition: EnableSentimentParquetSinkCondition
     Properties:
       CodeUri: lambdas/sentiment_to_s3_parquet
       Handler: app.handler
@@ -324,11 +336,13 @@ Resources:
 
   BacktestCluster:
     Type: AWS::ECS::Cluster
+    Condition: HasBacktestEcrImageUri
     Properties:
       ClusterName: trading-backtest-cluster
 
   BacktestTaskExecutionRole:
     Type: AWS::IAM::Role
+    Condition: HasBacktestEcrImageUri
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -343,6 +357,7 @@ Resources:
 
   BacktestTaskRole:
     Type: AWS::IAM::Role
+    Condition: HasBacktestEcrImageUri
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -372,6 +387,7 @@ Resources:
 
   BacktestTaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    Condition: HasBacktestEcrImageUri
     Properties:
       Family: trading-backtester
       Cpu: '2048'
@@ -405,6 +421,7 @@ Resources:
 
   BacktestSchedulerRole:
     Type: AWS::IAM::Role
+    Condition: HasBacktestEcrImageUri
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -433,6 +450,7 @@ Resources:
 
   WeeklyBacktestSchedule:
     Type: AWS::Scheduler::Schedule
+    Condition: HasBacktestEcrImageUri
     Properties:
       Name: weekly-vectorbt-backtest
       Description: Run vectorbt threshold optimization every Sunday 23:00 UTC.
@@ -464,5 +482,6 @@ Outputs:
   TradeExecutorFunctionArn:
     Value: !GetAtt TradeExecutorFunction.Arn
   BacktestTaskDefinitionArn:
+    Condition: HasBacktestEcrImageUri
     Value: !Ref BacktestTaskDefinition
 
