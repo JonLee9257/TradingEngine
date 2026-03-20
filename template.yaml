@@ -21,7 +21,8 @@ Parameters:
 
   TopSymbols:
     Type: String
-    Default: AAPL,MSFT,NVDA,AMZN,TSLA,GOOGL,META,AMD,INTC,PLTR
+    #Default: AAPL,MSFT,NVDA,AMZN,TSLA,GOOGL,META,AMD,INTC,PLTR
+    Default: TSLA
     Description: Comma-separated list of symbols (first 10 are used)
 
   NewsApiSecretId:
