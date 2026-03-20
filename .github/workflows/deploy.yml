@@ -38,7 +38,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: SAM build
-        run: sam build
+        run: sam build --use-container
 
       - name: SAM deploy
         run: |
