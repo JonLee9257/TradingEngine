@@ -1,0 +1,16 @@
+---
+description: Repo hygiene to keep diffs focused and avoid committing build artifacts
+alwaysApply: true
+---
+
+# Avoid committing generated junk
+
+- Never add/commit `.aws-sam/` build output or SAM artifacts.
+- Never add/commit `.DS_Store`.
+- Never add/commit `__pycache__/` or `*.pyc` (keep `__pycache__/` out via `.gitignore`).
+
+# Testing / validation after substantive edits
+
+- For Python logic changes: run `python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py`.
+- For `template.yaml` / IaC changes: run `sam validate --lint`.
+

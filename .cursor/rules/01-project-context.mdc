@@ -1,0 +1,17 @@
+---
+description: Persistent project context for the AWS serverless trading pipeline
+alwaysApply: true
+---
+
+# Project Invariants
+
+- Pipeline order is fixed: `news_fetcher` (EventBridge -> NewsAPI) -> SQS -> `sentiment_analyzer` (Claude -> DynamoDB) -> invokes `trade_executor` (DynamoDB -> Alpaca).
+- `run_id` is the correlation key across the entire pipeline; keep it stable per batch/job.
+- `trade_executor` must remain idempotent per (`run_id`, `symbol`) using DynamoDB conditional writes.
+
+# CloudWatch P&L conventions (custom metrics)
+
+- Only publish numeric fields via `PutMetricData`; CloudWatch metrics cannot use strings.
+- Metrics are named by snapshot keys converted to PascalCase (e.g. `equity_usd` -> `EquityUsd`).
+- Use a `PaperTrading=true|false` dimension (from `ALPACA_PAPER`) and namespace `Trading/Paper` by default.
+
