@@ -85,6 +85,15 @@ Parameters:
   TradeQty:
     Type: String
     Default: ''
+  TradeOnlyAtClose:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  CloseWindowMinutes:
+    Type: Number
+    Default: 5
 
   LogLevel:
     Type: String
@@ -149,6 +158,7 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
           ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
           ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
           ALPACA_PAPER: 'true'
@@ -157,6 +167,8 @@ Resources:
           SENTIMENT_SELL_THRESHOLD: !Ref SentimentSellThreshold
           TRADE_NOTIONAL_USD: !Ref TradeNotionalUsd
           TRADE_QTY: !Ref TradeQty
+          TRADE_ONLY_AT_CLOSE: !Ref TradeOnlyAtClose
+          CLOSE_WINDOW_MINUTES: !Ref CloseWindowMinutes
           LOG_LEVEL: !Ref LogLevel
           FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
           PUBLISH_CLOUDWATCH_METRICS: !Ref PublishCloudWatchMetrics
@@ -205,6 +217,7 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
           TRADE_EXECUTOR_FUNCTION_ARN: !GetAtt TradeExecutorFunction.Arn
           ANTHROPIC_API_KEY: !Sub '{{resolve:secretsmanager:${AnthropicApiSecretId}:SecretString:${AnthropicSecretJsonKey}}}'
           ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
@@ -228,6 +241,25 @@ Resources:
             Queue: !GetAtt SentimentQueue.Arn
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
+
+  RealTimeTradingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RealTimeTradingRule
+      Description: Optional 1-minute trigger for news fetcher (disabled by default).
+      ScheduleExpression: rate(1 minute)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt NewsFetcherFunction.Arn
+          Id: NewsFetcherFunctionTarget
+
+  AllowEventBridgeInvokeNewsFetcher:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NewsFetcherFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RealTimeTradingRule.Arn
 
 Outputs:
   SentimentQueueUrl:

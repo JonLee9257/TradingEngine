@@ -328,6 +328,52 @@ def _get_env_decimal(name: str, default: Decimal) -> Decimal:
     return Decimal(raw)
 
 
+def _get_strategy_config(*, table, symbol: str) -> dict:
+    """
+    Read latest strategy config from DynamoDB:
+      PK(run_id)=STRATEGY#<SYMBOL>, SK(sort_key)=LATEST
+    Returns {"is_active": bool, "optimized_threshold": Decimal}
+    """
+    key = {"run_id": f"STRATEGY#{symbol}", "sort_key": "LATEST"}
+    item = table.get_item(Key=key).get("Item") or {}
+    # Conservative defaults: inactive strategy, threshold 1.0 (practically no trade)
+    raw_active = item.get("is_active", False)
+    if isinstance(raw_active, bool):
+        is_active = raw_active
+    else:
+        is_active = str(raw_active).strip().lower() == "true"
+    raw_threshold = item.get("optimized_threshold")
+    if raw_threshold is None or raw_threshold == "":
+        optimized_threshold = Decimal("1")
+    elif isinstance(raw_threshold, Decimal):
+        optimized_threshold = raw_threshold
+    else:
+        optimized_threshold = Decimal(str(raw_threshold))
+    return {"is_active": is_active, "optimized_threshold": optimized_threshold}
+
+
+def _should_trade_now_close_only(trading_client: TradingClient) -> bool:
+    """
+    If TRADE_ONLY_AT_CLOSE=true, allow trading only in the final N minutes of regular session.
+    """
+    if os.getenv("TRADE_ONLY_AT_CLOSE", "true").lower() != "true":
+        return True
+
+    close_window_minutes = int(os.getenv("CLOSE_WINDOW_MINUTES", "5"))
+    clock = trading_client.get_clock()
+    is_open = bool(getattr(clock, "is_open", False))
+    if not is_open:
+        return False
+
+    now_dt = getattr(clock, "timestamp", None)
+    next_close_dt = getattr(clock, "next_close", None)
+    if now_dt is None or next_close_dt is None:
+        return False
+
+    mins_to_close = (next_close_dt - now_dt).total_seconds() / 60.0
+    return 0 <= mins_to_close <= close_window_minutes
+
+
 def handler(event, context):
     """
     Invoke with: {"run_id": "..."}.
@@ -338,8 +384,10 @@ def handler(event, context):
     if not run_id:
         raise ValueError("Missing required input: run_id")
 
-    # DynamoDB table handle.
+    # DynamoDB table handles (strategy can be same table or a dedicated table).
     table = boto3.resource("dynamodb").Table(os.environ["DYNAMODB_TABLE_NAME"])
+    strategy_table_name = os.getenv("STRATEGY_TABLE_NAME", os.environ["DYNAMODB_TABLE_NAME"])
+    strategy_table = boto3.resource("dynamodb").Table(strategy_table_name)
 
     # Trading thresholds control when to place BUY/SELL orders.
     buy_threshold = _get_env_decimal("SENTIMENT_BUY_THRESHOLD", Decimal("0.2"))
@@ -348,6 +396,13 @@ def handler(event, context):
 
     # Create Alpaca API client.
     trading_client = _get_trade_client()
+    if not _should_trade_now_close_only(trading_client):
+        logger.info(
+            "Skipping execution: not in close-only trading window",
+            extra={"run_id": run_id, "close_only": os.getenv("TRADE_ONLY_AT_CLOSE", "true")},
+        )
+        snap_none = _snapshot_and_publish_telemetry(trading_client, run_id)
+        return {"status": "ok", "run_id": run_id, "trades": 0, "account_snapshot": snap_none}
 
     # Query only sentiment items for this run_id.
     # sort_key begins_with("SENTIMENT#")
@@ -374,6 +429,28 @@ def handler(event, context):
             sentiment_score = sentiment_score_raw
         else:
             sentiment_score = Decimal(str(sentiment_score_raw))
+
+        try:
+            strategy = _get_strategy_config(table=strategy_table, symbol=symbol)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed reading strategy config", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
+            continue
+        if not strategy["is_active"]:
+            logger.info("Strategy inactive; skipping symbol", extra={"run_id": run_id, "symbol": symbol})
+            continue
+        if sentiment_score < strategy["optimized_threshold"]:
+            logger.info(
+                "Sentiment score below optimized threshold; skipping symbol",
+                extra={
+                    "run_id": run_id,
+                    "symbol": symbol,
+                    "score": str(sentiment_score),
+                    "optimized_threshold": str(strategy["optimized_threshold"]),
+                },
+            )
+            continue
+
         side = _decide_side(
             score=sentiment_score,
             buy_threshold=buy_threshold,

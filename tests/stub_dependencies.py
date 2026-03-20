@@ -112,6 +112,21 @@ def install_stubs() -> None:
         requests_stub.get = get
         sys.modules["requests"] = requests_stub
 
+    # ---- pytz ----
+    if "pytz" not in sys.modules:
+        pytz_stub = types.ModuleType("pytz")
+
+        def timezone(_name: str):  # pragma: no cover
+            from datetime import timedelta, timezone as _tz
+
+            # Minimal stub sufficient for astimezone() in unit tests.
+            if _name == "America/New_York":
+                return _tz(timedelta(hours=-4))
+            return _tz.utc
+
+        pytz_stub.timezone = timezone
+        sys.modules["pytz"] = pytz_stub
+
     # ---- alpaca-py ----
     if "alpaca" not in sys.modules:
         alpaca_stub = types.ModuleType("alpaca")

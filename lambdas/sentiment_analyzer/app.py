@@ -17,9 +17,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 import boto3
+import pytz
 import requests
 from anthropic import Anthropic
 from botocore.exceptions import ClientError
@@ -30,7 +30,7 @@ from pydantic import BaseModel
 # `logger` writes logs to CloudWatch.
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
-EASTERN_TZ = ZoneInfo("America/New_York")
+EASTERN_TZ = pytz.timezone("America/New_York")
 
 try:
     # Optional local-dev support.
@@ -231,6 +231,40 @@ def _next_regular_open_utc(ts_utc: datetime) -> datetime:
     Return the UTC datetime for the next regular-session open (09:30 ET)
     at or after the reference timestamp.
     """
+    # Try Alpaca calendar first (handles market holidays/closures better than weekday-only logic).
+    # Falls back to weekday logic when API is unavailable.
+    try:
+        api_key = os.environ["ALPACA_API_KEY"]
+        api_secret = os.environ["ALPACA_SECRET_KEY"]
+        base_url = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+        headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+        }
+        start_date = ts_utc.astimezone(EASTERN_TZ).date().isoformat()
+        end_date = (ts_utc.astimezone(EASTERN_TZ).date() + timedelta(days=10)).isoformat()
+        resp = requests.get(
+            f"{base_url}/v2/calendar",
+            headers=headers,
+            params={"start": start_date, "end": end_date},
+            timeout=float(os.getenv("ALPACA_PRICE_TIMEOUT_SECONDS", "10")),
+        )
+        resp.raise_for_status()
+        calendar_rows = resp.json() or []
+        ts_et = ts_utc.astimezone(EASTERN_TZ)
+        for row in calendar_rows:
+            date_s = row.get("date")
+            open_s = row.get("open")
+            if not date_s or not open_s:
+                continue
+            # Example calendar row: {"date":"2026-03-19","open":"09:30",...}
+            open_dt_naive = datetime.strptime(f"{date_s} {open_s}", "%Y-%m-%d %H:%M")
+            open_dt_et = EASTERN_TZ.localize(open_dt_naive)
+            if open_dt_et >= ts_et:
+                return open_dt_et.astimezone(timezone.utc)
+    except Exception:
+        logger.debug("Alpaca calendar lookup failed; using weekday fallback for next open", exc_info=True)
+
     ts_et = ts_utc.astimezone(EASTERN_TZ)
     wd = ts_et.weekday()
     open_today = ts_et.replace(hour=9, minute=30, second=0, microsecond=0)

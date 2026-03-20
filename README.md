@@ -5,15 +5,16 @@ This project implements the requested pipeline using AWS serverless components a
 Architecture:
 1. EventBridge cron triggers `news_fetcher` on weekdays at `09:30` (UTC by default).
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
-3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results in DynamoDB.
+3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results + backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
 5. `trade_executor` reads the sentiment for the given `run_id` from DynamoDB and places paper trades via Alpaca (idempotent per symbol per run).
 
 ## Repo Layout
 
 - `lambdas/news_fetcher/` (NewsAPI -> SQS)
-- `lambdas/sentiment_analyzer/` (SQS -> Claude sentiment -> DynamoDB -> invoke trade executor)
-- `lambdas/trade_executor/` (DynamoDB -> Alpaca paper trades)
+- `lambdas/sentiment_analyzer/` (SQS -> Claude sentiment + historical price context -> DynamoDB -> invoke trade executor)
+- `lambdas/trade_executor/` (DynamoDB sentiment + strategy config -> Alpaca paper trades)
+- `analysis/backtest_report.py` (scan SENTIMENT data + forward returns report)
 - `template.yaml` (AWS SAM IaC)
 - `.env.example` (local environment variable template)
 
@@ -110,6 +111,39 @@ sam deploy \
     ForceRefreshToken="2026-03-19T20:10:00Z"
 ```
 
+## Sentiment Data Model
+
+`sentiment_analyzer` stores one `SENTIMENT#<symbol>` item per symbol/run with fields for backtesting:
+
+- Core sentiment: `sentiment_label`, `sentiment_score`, `rationale`
+- Timing: `news_published_at`, `market_price_timestamp`, `analyzed_at`, `triggered_at`
+- Price context: `market_price_at_news`, `market_session`, `is_regular_hours`, `market_price_lookup_start_at`
+
+Market-session handling:
+
+- If `publishedAt` is in regular hours (09:30-16:00 ET), price lookup starts at that timestamp.
+- If `publishedAt` is outside regular hours, lookup shifts to the next regular open (09:30 ET on next trading weekday).
+
+## Strategy-Based Trading
+
+`trade_executor` checks strategy config before placing orders.
+
+Expected strategy item in DynamoDB:
+
+- PK (`run_id`): `STRATEGY#<SYMBOL>`
+- SK (`sort_key`): `LATEST`
+- Fields:
+  - `is_active` (Boolean)
+  - `optimized_threshold` (Decimal)
+
+Trading rule:
+
+- Only trade when:
+  - `is_active == true`, and
+  - `sentiment_score >= optimized_threshold`
+
+If strategy config is missing, defaults are conservative (`is_active=false`, threshold=`1.0`), so no accidental trade.
+
 ## How retries & safety work
 
 - SQS queue uses a DLQ with `maxReceiveCount: 3`.
@@ -118,7 +152,7 @@ sam deploy \
   - Claude (sentiment_analyzer)
   - Alpaca (trade_executor)
 - DynamoDB writes are idempotent per `run_id` and symbol:
-  - Sentiment items use conditional writes (`attribute_not_exists`) to avoid duplicates.
+  - Sentiment items use `batch_writer(overwrite_by_pkeys=["run_id","sort_key"])` for throughput and deterministic upsert on retries.
   - Trade execution writes `TRADE#<symbol>` records conditionally; if a trade record already exists, the executor skips it.
 
 ## CloudWatch P&L metrics (trade executor)
@@ -139,6 +173,14 @@ After each successful `trade_executor` run, the Lambda logs an **Alpaca account 
 - Trade sizing uses either:
   - `TRADE_NOTIONAL_USD`, or
   - `TRADE_QTY` (leave `TradeQty` empty to use notional).
+
+## Optional Real-Time Rule (disabled)
+
+`template.yaml` includes an optional `RealTimeTradingRule` (`rate(1 minute)`), currently:
+
+- `State: DISABLED`
+
+Enable only when you intentionally want near-real-time triggering.
 
 ## Local Development (optional)
 
@@ -208,5 +250,23 @@ Run:
 
 ```bash
 python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py
+```
+
+## Backtest Helper Script
+
+`analysis/backtest_report.py` helps with threshold research:
+
+- scans DynamoDB `item_type=SENTIMENT`
+- reads `sentiment_score` + `market_price_at_news`
+- fetches Alpaca closes at `+15m` and `+60m`
+- prints average return by sentiment-score bucket
+
+Run:
+
+```bash
+export DYNAMODB_TABLE_NAME=TradingNewsSentiment
+export ALPACA_API_KEY=...
+export ALPACA_SECRET_KEY=...
+python3 analysis/backtest_report.py
 ```
 

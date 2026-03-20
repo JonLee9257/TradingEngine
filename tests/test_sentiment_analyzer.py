@@ -94,6 +94,13 @@ class TestSentimentAnalyzer(unittest.TestCase):
             "PRE",
         )
 
+    def test_next_regular_open_weekday_fallback(self):
+        # 2026-03-18 22:00 UTC == 18:00 ET (post-market), should map to next day 09:30 ET.
+        out = self.mod._next_regular_open_utc(datetime(2026, 3, 18, 22, 0, tzinfo=timezone.utc))
+        # With the unit-test pytz stub (-04:00), 09:30 ET == 13:30 UTC.
+        self.assertEqual(out.hour, 13)
+        self.assertEqual(out.minute, 30)
+
     def test_analyze_sentiment_uses_structured_parse(self):
         # Patch the Anthropic client used inside the module.
         class DummyMessages:
