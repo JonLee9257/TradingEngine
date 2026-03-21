@@ -10,9 +10,10 @@ What it does:
 """
 
 import logging
+import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from decimal import Decimal
@@ -328,6 +329,119 @@ def _get_env_decimal(name: str, default: Decimal) -> Decimal:
     return Decimal(raw)
 
 
+def _parse_iso8601_utc(ts: object) -> Optional[datetime]:
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    normalized = ts.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _query_sentiment_window(*, table, symbol: str, now_utc: datetime, window_hours: int) -> list[dict]:
+    index_name = os.getenv("TICKER_TIMESTAMP_GSI_NAME", "TickerTimestampIndex")
+    start_utc = now_utc - timedelta(hours=window_hours)
+    start_iso = start_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    kwargs = {
+        "IndexName": index_name,
+        "KeyConditionExpression": Key("gsi_pk").eq(symbol) & Key("gsi_sk").between(start_iso, end_iso),
+        "FilterExpression": Attr("item_type").eq("SENTIMENT"),
+    }
+    items: list[dict] = []
+    while True:
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items
+
+
+def calculate_decayed_sentiment(articles: list[dict], *, now_utc: datetime, decay_lambda: float) -> tuple[float, float]:
+    """
+    Exponential decay weighted sentiment:
+      weight = e^(-lambda * age_hours)
+      signal = sum(score * weight) / sum(weight)
+    Returns (weighted_signal, raw_average).
+    """
+    weighted_sum = 0.0
+    weight_total = 0.0
+    raw_sum = 0.0
+    raw_n = 0
+    for item in articles:
+        raw_score = item.get("sentiment_score")
+        try:
+            score = float(raw_score) if not isinstance(raw_score, Decimal) else float(raw_score)
+        except (TypeError, ValueError):
+            continue
+
+        ts = _parse_iso8601_utc(item.get("news_published_at")) or _parse_iso8601_utc(item.get("analyzed_at"))
+        if ts is None:
+            continue
+        age_hours = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
+        weight = math.exp(-(decay_lambda * age_hours))
+        weighted_sum += score * weight
+        weight_total += weight
+        raw_sum += score
+        raw_n += 1
+
+    if weight_total <= 0.0 or raw_n == 0:
+        return 0.0, 0.0
+    return (weighted_sum / weight_total), (raw_sum / float(raw_n))
+
+
+def _compute_symbol_signal(*, table, symbol: str, now_utc: datetime) -> float:
+    # Primary window: 24h with slower decay.
+    items_24h = _query_sentiment_window(table=table, symbol=symbol, now_utc=now_utc, window_hours=24)
+    if items_24h:
+        signal, raw_avg = calculate_decayed_sentiment(items_24h, now_utc=now_utc, decay_lambda=0.1)
+        logger.info(
+            "Time-decayed sentiment window stats",
+            extra={
+                "symbol": symbol,
+                "window_hours": 24,
+                "total_articles": len(items_24h),
+                "raw_average": raw_avg,
+                "decayed_weighted_signal": signal,
+            },
+        )
+        return signal
+
+    # Fallback window: 7d with steeper decay.
+    items_7d = _query_sentiment_window(table=table, symbol=symbol, now_utc=now_utc, window_hours=24 * 7)
+    if items_7d:
+        signal, raw_avg = calculate_decayed_sentiment(items_7d, now_utc=now_utc, decay_lambda=0.5)
+        logger.info(
+            "Time-decayed sentiment window stats",
+            extra={
+                "symbol": symbol,
+                "window_hours": 24 * 7,
+                "total_articles": len(items_7d),
+                "raw_average": raw_avg,
+                "decayed_weighted_signal": signal,
+            },
+        )
+        return signal
+
+    logger.info(
+        "Time-decayed sentiment window stats",
+        extra={
+            "symbol": symbol,
+            "window_hours": 24 * 7,
+            "total_articles": 0,
+            "raw_average": 0.0,
+            "decayed_weighted_signal": 0.0,
+        },
+    )
+    return 0.0
+
+
 def _get_strategy_config(*, table, symbol: str) -> dict:
     """
     Read latest strategy config from DynamoDB:
@@ -419,16 +533,20 @@ def handler(event, context):
     # Track whether we encountered errors; if yes, we raise so Lambda/SQS retry can happen.
     had_errors = False
     trades_submitted = 0
+    now_utc = datetime.now(timezone.utc)
 
     for it in items:
         symbol = (it.get("symbol") or "").strip().upper()
         if not symbol:
             continue
-        sentiment_score_raw = it.get("sentiment_score") or Decimal("0")
-        if isinstance(sentiment_score_raw, Decimal):
-            sentiment_score = sentiment_score_raw
-        else:
-            sentiment_score = Decimal(str(sentiment_score_raw))
+        decayed_signal = _compute_symbol_signal(table=table, symbol=symbol, now_utc=now_utc)
+        sentiment_score = Decimal(str(decayed_signal))
+        if abs(float(sentiment_score)) < max(abs(float(buy_threshold)), abs(float(sell_threshold))):
+            logger.info(
+                "Decayed signal below trade threshold; skipping symbol",
+                extra={"run_id": run_id, "symbol": symbol, "decayed_weighted_signal": float(sentiment_score)},
+            )
+            continue
 
         try:
             strategy = _get_strategy_config(table=strategy_table, symbol=symbol)

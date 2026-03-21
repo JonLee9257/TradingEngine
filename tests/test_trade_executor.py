@@ -51,6 +51,7 @@ class TestTradeExecutor(unittest.TestCase):
                 "symbol": "AAPL",
                 "sentiment_score": 0.5,  # float from DynamoDB when using mocks
                 "sentiment_label": "positive",
+                "news_published_at": "2026-03-20T13:00:00Z",
             }
         ]
         dummy_table = DummyTable(items=table_items)

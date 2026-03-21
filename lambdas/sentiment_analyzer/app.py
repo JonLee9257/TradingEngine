@@ -522,6 +522,10 @@ def _build_sentiment_item_payload(*, run_id: str, symbol: str, item: dict, sourc
         "model": source.get("model"),
         "lambda_request_id": source.get("lambda_request_id"),
     }
+    # Secondary access path for time-window queries by symbol.
+    # ISO-8601 UTC lexical order matches chronological order.
+    payload["gsi_pk"] = symbol
+    payload["gsi_sk"] = item.get("news_published_at") or now_iso
     # Backtesting data-pipeline extension:
     # store point-in-time market price captured during sentiment processing.
     if item.get("market_price") is not None:
@@ -721,7 +725,7 @@ def _process_one_record(record: dict, *, table, trade_executor_arn: str, lambda_
 
 def handler(event, context):
     """
-    SQS consumer -> analyze sentiment with Claude -> store in DynamoDB -> invoke trade executor.
+    SQS consumer -> analyze sentiment with Claude -> store in DynamoDB -> invoke trade executor only at near close time.
     """
     # DynamoDB Table resource gives higher-level convenience methods.
     table = boto3.resource("dynamodb").Table(os.environ["DYNAMODB_TABLE_NAME"])
