@@ -192,6 +192,8 @@ Resources:
 
   TradeExecutorFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
     Properties:
       CodeUri: lambdas/trade_executor
       Handler: app.handler
@@ -224,6 +226,41 @@ Resources:
               Action:
                 - cloudwatch:PutMetricData
               Resource: '*'
+
+  ExitManagerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: lambdas/exit_manager
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
+          ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
+          ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
+          ALPACA_PAPER: 'true'
+          ENABLE_SHORTS: !Ref EnableShorts
+          SENTIMENT_BUY_THRESHOLD: !Ref SentimentBuyThreshold
+          SENTIMENT_SELL_THRESHOLD: !Ref SentimentSellThreshold
+          EXIT_EOD_WINDOW_MINUTES: !Ref CloseWindowMinutes
+          STRATEGY_HOLD_MINUTES: '60'
+          STRATEGY_EXIT_TYPE: fixed_time
+          LOG_LEVEL: !Ref LogLevel
+          FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTableName
+      Events:
+        ExitManagerEveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
 
   NewsFetcherFunction:
     Type: AWS::Serverless::Function
@@ -425,6 +462,10 @@ Resources:
               Value: !Ref BacktestSymbol
             - Name: BACKTEST_MIN_SHARPE_IMPROVEMENT
               Value: '0.1'
+            - Name: BACKTEST_HOLD_MINUTES
+              Value: '60'
+            - Name: BACKTEST_EXIT_TYPE
+              Value: fixed_time
           LogConfiguration:
             LogDriver: awslogs
             Options:

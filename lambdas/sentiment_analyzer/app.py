@@ -524,8 +524,8 @@ def _build_sentiment_item_payload(*, run_id: str, symbol: str, item: dict, sourc
     }
     # Secondary access path for time-window queries by symbol.
     # ISO-8601 UTC lexical order matches chronological order.
-    payload["gsi_pk"] = symbol
-    payload["gsi_sk"] = item.get("news_published_at") or now_iso
+    payload["gsi_pk"] = symbol # symbol is the partition key for the global secondary index
+    payload["gsi_sk"] = item.get("news_published_at") or now_iso # news_published_at is the sort key for the global secondary index
     # Backtesting data-pipeline extension:
     # store point-in-time market price captured during sentiment processing.
     if item.get("market_price") is not None:

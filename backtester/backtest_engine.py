@@ -12,9 +12,12 @@ import gzip
 import io
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import boto3
 import numpy as np
@@ -23,12 +26,29 @@ import requests
 import vectorbt as vbt
 from boto3.dynamodb.types import TypeDeserializer
 
+# Repo layout: `backtester/backtest_engine.py` vs Docker `/app/backtest_engine.py`
+_bt_dir = Path(__file__).resolve().parent
+if _bt_dir.name == "backtester":
+    _repo_root = str(_bt_dir.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
+from strategies.base import BaseStrategy  # noqa: E402
+from strategies.sentiment_v1 import MorningSentimentStrategy  # noqa: E402
+
 _DESERIALIZER = TypeDeserializer()
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
-def _load_latest_data(path: str) -> pd.DataFrame:
-    # Requires pyarrow + s3fs (installed by vectorbt[full]/awswrangler deps).
-    return pd.read_parquet(path)
+def _load_latest_data(path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Universal data provider for parquet inputs.
+    Returns world state:
+      - price_df: MultiIndex [symbol, ts] with raw 1m OHLCV bars
+      - news_df: MultiIndex [symbol, article_ts] with raw sentiment score fields
+    """
+    raw = pd.read_parquet(path)
+    return _build_world_state(raw)
 
 
 def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
@@ -40,15 +60,10 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
 
 
 def _ddb_unmarshal(item: dict) -> dict:
-    # Native export payload is DynamoDB JSON, e.g. {"symbol":{"S":"TSLA"}, ...}
     return {k: _DESERIALIZER.deserialize(v) for k, v in item.items()}
 
 
-def _load_native_export_data(export_s3_prefix: str) -> pd.DataFrame:
-    """
-    Load SENTIMENT rows from DynamoDB native export files (DYNAMODB_JSON).
-    Expected line format in gz files: {"Item": { ...ddb-json... }}
-    """
+def _load_native_export_data(export_s3_prefix: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     s3 = boto3.client("s3")
     bucket, prefix = _parse_s3_uri(export_s3_prefix.rstrip("/") + "/")
     data_prefix = f"{prefix}data/"
@@ -72,7 +87,8 @@ def _load_native_export_data(export_s3_prefix: str) -> pd.DataFrame:
                     if item.get("item_type") == "SENTIMENT":
                         rows.append(item)
 
-    return pd.DataFrame(rows)
+    raw = pd.DataFrame(rows)
+    return _build_world_state(raw)
 
 
 def _parse_s3_parts(s3_uri: str) -> tuple[str, str]:
@@ -89,7 +105,6 @@ def _fetch_week_bars_from_alpaca(symbol: str, week_start_utc: pd.Timestamp) -> p
     feed = os.getenv("ALPACA_DATA_FEED", "iex")
     timeout_s = float(os.getenv("ALPACA_PRICE_TIMEOUT_SECONDS", "10"))
 
-    # Include +2h buffer at week end to support +60m forward lookup on late Friday signals.
     start = week_start_utc.tz_convert("UTC")
     end = start + pd.Timedelta(days=7, hours=2)
     url = f"{base_url}/v2/stocks/{symbol}/bars"
@@ -107,22 +122,21 @@ def _fetch_week_bars_from_alpaca(symbol: str, week_start_utc: pd.Timestamp) -> p
     resp.raise_for_status()
     bars = (resp.json() or {}).get("bars") or []
     if not bars:
-        return pd.DataFrame(columns=["ts", "close"])
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
     out = pd.DataFrame(
         {
             "ts": pd.to_datetime([b.get("t") for b in bars], utc=True, errors="coerce"),
+            "open": pd.to_numeric([b.get("o") for b in bars], errors="coerce"),
+            "high": pd.to_numeric([b.get("h") for b in bars], errors="coerce"),
+            "low": pd.to_numeric([b.get("l") for b in bars], errors="coerce"),
             "close": pd.to_numeric([b.get("c") for b in bars], errors="coerce"),
+            "volume": pd.to_numeric([b.get("v") for b in bars], errors="coerce"),
         }
-    ).dropna(subset=["ts", "close"])
+    ).dropna(subset=["ts", "open", "high", "low", "close"])
     return out.sort_values("ts")
 
 
 def _load_or_build_week_bars_cache(symbol: str, week_start_utc: pd.Timestamp, cache_prefix: str) -> pd.DataFrame:
-    """
-    S3 cache pattern:
-    1) Check weekly parquet cache in S3
-    2) If cache miss, fetch from Alpaca and write parquet cache
-    """
     s3 = boto3.client("s3")
     cache_path = (
         f"{cache_prefix.rstrip('/')}/"
@@ -141,84 +155,153 @@ def _load_or_build_week_bars_cache(symbol: str, week_start_utc: pd.Timestamp, ca
     return bars
 
 
-def _ensure_forward_returns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    if "ret_60m" in df.columns and df["ret_60m"].notna().any():
-        return df
+def _build_world_state(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build strategy-agnostic world state:
+      - price_df: MultiIndex [symbol, ts], raw 1m OHLCV in regular session
+      - news_df: MultiIndex [symbol, article_ts], raw sentiment fields
+    """
+    if "symbol" in raw_df.columns:
+        raw_df["symbol"] = raw_df["symbol"].astype(str).str.upper()
+    if "sentiment_score" in raw_df.columns:
+        raw_df["sentiment_score"] = pd.to_numeric(raw_df["sentiment_score"], errors="coerce")
 
+    # Build normalized sentiment/events table.
+    ts_cols = [c for c in ["published_at", "news_published_at", "market_price_timestamp", "analyzed_at"] if c in raw_df.columns]
+    news = raw_df.copy()
+    if "symbol" not in news.columns or not ts_cols:
+        empty_prices = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        empty_prices.index = pd.MultiIndex.from_arrays([[], []], names=["symbol", "ts"])
+        empty_news = pd.DataFrame(columns=["article_score", "sentiment_score"])
+        empty_news.index = pd.MultiIndex.from_arrays([[], []], names=["symbol", "article_ts"])
+        return empty_prices, empty_news
+
+    article_ts = None
+    for c in ts_cols:
+        parsed = pd.to_datetime(news[c], utc=True, errors="coerce")
+        article_ts = parsed if article_ts is None else article_ts.fillna(parsed)
+    news["article_ts"] = article_ts
+    news["article_score"] = pd.to_numeric(news.get("sentiment_score"), errors="coerce")
+    news = news.dropna(subset=["symbol", "article_ts", "article_score"]).sort_values(["symbol", "article_ts"])
+    if news.empty:
+        empty_prices = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        empty_prices.index = pd.MultiIndex.from_arrays([[], []], names=["symbol", "ts"])
+        empty_news = pd.DataFrame(columns=["article_score", "sentiment_score"])
+        empty_news.index = pd.MultiIndex.from_arrays([[], []], names=["symbol", "article_ts"])
+        return empty_prices, empty_news
+
+    news_world = news.set_index(["symbol", "article_ts"]).sort_index()
+
+    # Build raw OHLCV bars for each symbol and date range seen in sentiment.
     cache_prefix = os.getenv("S3_BARS_CACHE_PREFIX", "")
     if not cache_prefix:
-        raise ValueError("Missing S3_BARS_CACHE_PREFIX for Alpaca bars cache.")
+        raise ValueError("Missing S3_BARS_CACHE_PREFIX for bars cache.")
+    price_parts: list[pd.DataFrame] = []
+    for symbol, grp in news.groupby("symbol"):
+        start_ts = grp["article_ts"].min().floor("D")
+        end_ts = grp["article_ts"].max().ceil("D")
+        week_starts = pd.date_range(start=start_ts, end=end_ts + pd.Timedelta(days=7), freq="W-MON", tz="UTC")
+        symbol_parts: list[pd.DataFrame] = []
+        for ws in week_starts:
+            symbol_parts.append(
+                _load_or_build_week_bars_cache(symbol=symbol, week_start_utc=pd.Timestamp(ws), cache_prefix=cache_prefix)
+            )
+        bars = pd.concat(symbol_parts, ignore_index=True) if symbol_parts else pd.DataFrame()
+        if bars.empty:
+            continue
+        bars = bars.dropna(subset=["ts", "open", "high", "low", "close"]).drop_duplicates(subset=["ts"]).sort_values("ts")
+        bars["ts"] = pd.to_datetime(bars["ts"], utc=True, errors="coerce")
+        bars = bars[~bars["ts"].isna()]
+        # Keep regular session bars so any strategy exit between 9:30 and 16:00 has coverage.
+        local = bars["ts"].dt.tz_convert(EASTERN_TZ)
+        # Regular session: 9:30 ET through 16:00 ET only (hour<=16, but minute==0 when hour==16).
+        regular = ((local.dt.hour > 9) | ((local.dt.hour == 9) & (local.dt.minute >= 30))) & (
+            (local.dt.hour <= 16) & ((local.dt.hour < 16) | (local.dt.minute == 0))
+        )
+        bars = bars[regular].copy()
+        if bars.empty:
+            continue
+        bars["symbol"] = symbol
+        price_parts.append(bars[["symbol", "ts", "open", "high", "low", "close", "volume"]])
 
-    work = df.copy()
-    ts_primary = work.get("market_price_timestamp")
-    if ts_primary is None:
-        ts_primary = pd.Series([None] * len(work), index=work.index)
-    ts_fallback = work.get("news_published_at")
-    if ts_fallback is None:
-        ts_fallback = pd.Series([None] * len(work), index=work.index)
-    work["ts"] = pd.to_datetime(ts_primary.fillna(ts_fallback), utc=True, errors="coerce")
-    work["entry_price"] = pd.to_numeric(
-        work.get("entry_price", work.get("market_price_at_news", work.get("market_price"))), errors="coerce"
+    if not price_parts:
+        empty_prices = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        empty_prices.index = pd.MultiIndex.from_arrays([[], []], names=["symbol", "ts"])
+        return empty_prices, news_world
+
+    price_world = pd.concat(price_parts, ignore_index=True).set_index(["symbol", "ts"]).sort_index()
+    return price_world, news_world
+
+
+def _apply_strategy_params(strategy: BaseStrategy, params: dict) -> None:
+    # Prefer explicit strategy hook, then fallback to direct attribute set.
+    if hasattr(strategy, "set_params"):
+        strategy.set_params(**params)
+    else:
+        for k, v in params.items():
+            setattr(strategy, k, v)
+
+
+def _sharpe_for_params(price_df: pd.DataFrame, news_df: pd.DataFrame, strategy: BaseStrategy, params: dict) -> float:
+    _apply_strategy_params(strategy, params)
+    entries, exits = strategy.generate_signals(price_df, news_df)
+    if entries.empty:
+        return float("nan")
+    pf = vbt.Portfolio.from_signals(
+        close=price_df["close"],
+        entries=entries,
+        exits=exits,
+        freq="1min",
     )
-    if "symbol" not in work.columns:
-        return work.iloc[0:0]
-    work = work[work["symbol"].astype(str).str.upper() == symbol]
-    work = work.dropna(subset=["ts", "entry_price"]).sort_values("ts")
-    if work.empty:
-        return work
-
-    week_starts = work["ts"].dt.tz_convert("UTC").dt.to_period("W-MON").dt.start_time.dt.tz_localize("UTC").unique()
-    all_bars: list[pd.DataFrame] = []
-    for ws in week_starts:
-        all_bars.append(_load_or_build_week_bars_cache(symbol=symbol, week_start_utc=pd.Timestamp(ws), cache_prefix=cache_prefix))
-    bars_df = pd.concat(all_bars, ignore_index=True) if all_bars else pd.DataFrame(columns=["ts", "close"])
-    bars_df = bars_df.dropna(subset=["ts", "close"]).sort_values("ts")
-    if bars_df.empty:
-        work["ret_60m"] = np.nan
-        return work
-
-    targets = work[["ts"]].copy()
-    targets["target_ts"] = targets["ts"] + pd.Timedelta(minutes=60)
-    merged = pd.merge_asof(
-        targets.sort_values("target_ts"),
-        bars_df.rename(columns={"ts": "bar_ts", "close": "close_60m"}),
-        left_on="target_ts",
-        right_on="bar_ts",
-        direction="forward",
-        tolerance=pd.Timedelta(minutes=5),
-    )
-    work = work.reset_index(drop=True)
-    work["close_60m"] = merged["close_60m"].values
-    work["ret_60m"] = (work["close_60m"] / work["entry_price"]) - 1.0
-    return work
+    return float(pf.sharpe_ratio())
 
 
-def _optimize_threshold(df: pd.DataFrame, symbol: str) -> tuple[float, float]:
-    d = df[df["symbol"] == symbol].copy()
-    if d.empty:
-        raise RuntimeError(f"No parquet rows for symbol={symbol}")
+def _iter_param_grid(param_space: dict) -> list[dict]:
+    # Requested: use vbt.ParamGrid for universal parameter sweeps.
+    if hasattr(vbt, "ParamGrid"):
+        grid = vbt.ParamGrid(param_space)
+        # vectorbt ParamGrid is iterable in recent versions; fallback below if not.
+        try:
+            return [dict(p) for p in grid]
+        except Exception:
+            pass
+    # Fallback cartesian product if ParamGrid is unavailable in runtime version.
+    keys = list(param_space.keys())
+    vals = [list(v) for v in param_space.values()]
+    if not keys:
+        return [{}]
+    out: list[dict] = [{}]
+    for k, arr in zip(keys, vals):
+        nxt: list[dict] = []
+        for d in out:
+            for v in arr:
+                nd = dict(d)
+                nd[k] = v
+                nxt.append(nd)
+        out = nxt
+    return out
 
-    d = _ensure_forward_returns(d, symbol)
-    d["ts"] = pd.to_datetime(d["ts"], utc=True, errors="coerce")
-    d = d.dropna(subset=["ts", "entry_price", "ret_60m", "sentiment_score"]).sort_values("ts")
-    if d.empty:
-        raise RuntimeError(f"No usable rows after cleaning for symbol={symbol}")
 
-    close = pd.Series((1.0 + d["ret_60m"].astype(float)).cumprod().values, index=d["ts"])
-    thresholds = np.round(np.arange(0.5, 0.951, 0.01), 2)
-    best_thr = 0.5
+def _optimize_threshold(
+    price_df: pd.DataFrame,
+    news_df: pd.DataFrame,
+    strategy: BaseStrategy,
+    *,
+    param_space: dict | None = None,
+) -> tuple[dict, float]:
+    grid_space = param_space or {"threshold": np.round(np.arange(0.5, 0.951, 0.01), 2).tolist()}
+    params_grid = _iter_param_grid(grid_space)
+    if not params_grid:
+        raise RuntimeError("Empty parameter grid for optimization")
+
+    best_params = params_grid[0]
     best_sharpe = float("-inf")
-
-    for thr in thresholds:
-        entries = pd.Series((d["sentiment_score"].astype(float) >= thr).values, index=d["ts"])
-        exits = entries.shift(1).fillna(False) & (~entries)
-        pf = vbt.Portfolio.from_signals(close=close, entries=entries, exits=exits, freq="1h")
-        sharpe = float(pf.sharpe_ratio())
+    for params in params_grid:
+        sharpe = _sharpe_for_params(price_df, news_df, strategy, params)
         if np.isfinite(sharpe) and sharpe > best_sharpe:
             best_sharpe = sharpe
-            best_thr = float(thr)
-
-    return best_thr, best_sharpe
+            best_params = dict(params)
+    return best_params, best_sharpe
 
 
 def _current_strategy_threshold(table, symbol: str) -> float | None:
@@ -236,40 +319,63 @@ def main() -> None:
     parquet_path = os.getenv("S3_PARQUET_PATH", "")
     native_export_prefix = os.getenv("S3_DDB_EXPORT_PREFIX", "")
     min_improvement = float(os.getenv("BACKTEST_MIN_SHARPE_IMPROVEMENT", "0.1"))
+    hold_minutes = int(os.getenv("BACKTEST_HOLD_MINUTES", "60"))
+    exit_type = os.getenv("BACKTEST_EXIT_TYPE", "fixed_time")
 
     if parquet_path:
-        df = _load_latest_data(parquet_path)
+        price_world, news_world = _load_latest_data(parquet_path)
         source_path = parquet_path
     elif native_export_prefix:
-        df = _load_native_export_data(native_export_prefix)
+        price_world, news_world = _load_native_export_data(native_export_prefix)
         source_path = native_export_prefix
     else:
         raise ValueError("Set either S3_PARQUET_PATH or S3_DDB_EXPORT_PREFIX.")
 
-    # Normalize numeric fields from either parquet or native-export source.
-    if "symbol" in df.columns:
-        df["symbol"] = df["symbol"].astype(str).str.upper()
-    if "sentiment_score" in df.columns:
-        df["sentiment_score"] = pd.to_numeric(df["sentiment_score"], errors="coerce")
-    if "entry_price" not in df.columns:
-        df["entry_price"] = pd.to_numeric(
-            df.get("market_price_at_news", df.get("market_price")),
-            errors="coerce",
-        )
+    if news_world.empty:
+        raise RuntimeError(f"No usable sentiment rows for symbol={symbol}")
 
+    try:
+        news_df = news_world.xs(symbol, level="symbol", drop_level=True).copy()
+    except Exception:
+        news_df = pd.DataFrame(columns=["article_score", "sentiment_score"])
+    try:
+        price_df = price_world.xs(symbol, level="symbol", drop_level=True).copy()
+    except Exception:
+        price_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    if news_df.empty:
+        raise RuntimeError(f"No usable sentiment rows for symbol={symbol}")
+    if price_df.empty:
+        raise RuntimeError(f"No bars loaded for symbol={symbol}")
+
+    # Strategy reads close + index, but world-state keeps full OHLCV.
+    price_df = price_df.sort_index()
+
+    strategy: BaseStrategy = MorningSentimentStrategy(
+        threshold=0.5,
+        exit_type=exit_type,
+        hold_minutes=hold_minutes,
+    )
     table = boto3.resource("dynamodb").Table(table_name)
-    new_threshold, new_sharpe = _optimize_threshold(df, symbol)
+    best_params, new_sharpe = _optimize_threshold(
+        price_df,
+        news_df,
+        strategy,
+        param_space={"threshold": np.round(np.arange(0.5, 0.951, 0.01), 2).tolist()},
+    )
+    new_threshold = float(best_params.get("threshold", 0.5))
     current_threshold = _current_strategy_threshold(table, symbol)
 
-    # Evaluate the existing threshold using the same result set if available.
-    improved = True
+    current_sharpe: float | None = None
     if current_threshold is not None:
-        improved = abs(new_threshold - current_threshold) >= 0.01 and new_sharpe >= min_improvement
+        current_sharpe = _sharpe_for_params(price_df, news_df, strategy, {"threshold": float(current_threshold)})
+
+    improved = True if current_sharpe is None else (new_sharpe >= (current_sharpe + min_improvement))
 
     if not improved:
         print(
             f"Skip write: symbol={symbol} new_threshold={new_threshold:.2f} "
-            f"new_sharpe={new_sharpe:.4f} current_threshold={current_threshold}"
+            f"new_sharpe={new_sharpe:.4f} current_threshold={current_threshold} current_sharpe={current_sharpe}"
         )
         return
 
@@ -279,8 +385,10 @@ def main() -> None:
         "sort_key": ts,
         "item_type": "BACKTEST",
         "symbol": symbol,
+        "strategy_name": getattr(strategy, "strategy_name", strategy.__class__.__name__),
         "candidate_threshold": Decimal(str(round(new_threshold, 2))),
         "candidate_sharpe": Decimal(str(round(new_sharpe, 6))),
+        "current_sharpe": Decimal(str(round(current_sharpe, 6))) if current_sharpe is not None else Decimal("-1"),
         "current_threshold": Decimal(str(current_threshold if current_threshold is not None else -1)),
         "source_parquet_path": source_path,
         "created_at": datetime.now(timezone.utc).isoformat(),

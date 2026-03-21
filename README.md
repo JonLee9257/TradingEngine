@@ -7,19 +7,22 @@ Architecture:
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
 3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results + backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
-5. `trade_executor` reads the sentiment for the given `run_id` from DynamoDB and places paper trades via Alpaca (idempotent per symbol per run).
-6. DynamoDB Streams triggers `sentiment_to_s3_parquet`, which appends new `SENTIMENT` rows into an S3 Parquet lake.
-7. A weekly EventBridge Scheduler job runs an ECS Fargate VectorBT backtest task to evaluate threshold quality.
+5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls **`strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with **`status=OPEN`**, **`hold_minutes`**, **`strategy_name`**, and **`exit_type`** for the exit manager.
+6. **`exit_manager`** (Lambda 4) runs on **EventBridge `rate(1 minute)`**: scans for **`TRADE` + `status=OPEN`**, then exits per **`exit_type`** — **`fixed_time`** (after `submitted_at + hold_minutes`), **`end_of_day`** (within `EXIT_EOD_WINDOW_MINUTES` of Alpaca close), or **`signal_flip`** (strategy **`check_live_signal`** side vs entry side). It submits a flattening market order on Alpaca and sets **`status=CLOSED`**, **`realized_pnl_usd`** (position `unrealized_pl` snapshot at exit), **`exit_alpaca_order_id`**, **`closed_at`**, **`exit_reason`**.
+7. DynamoDB Streams triggers `sentiment_to_s3_parquet`, which appends new `SENTIMENT` rows into an S3 Parquet lake.
+8. A weekly EventBridge Scheduler job runs an ECS Fargate VectorBT backtest task to evaluate threshold quality.
 
 ## Repo Layout
 
 - `lambdas/news_fetcher/` (NewsAPI -> SQS)
 - `lambdas/sentiment_analyzer/` (SQS -> Claude sentiment + historical price context -> DynamoDB -> invoke trade executor)
 - `lambdas/trade_executor/` (DynamoDB sentiment + strategy config -> Alpaca paper trades)
+- `lambdas/exit_manager/` (scheduled: close OPEN `TRADE` rows per `exit_type`)
 - `lambdas/sentiment_to_s3_parquet/` (DynamoDB stream -> S3 Parquet sink via awswrangler)
 - `analysis/backtest_report.py` (scan SENTIMENT data + forward returns report)
 - `scripts/dynamodb_native_export.py` (enable PITR + start native export to S3)
 - `backtester/` (Dockerized VectorBT engine + ECS task definition template)
+- `strategies/` (shared **BaseStrategy** + **MorningSentimentStrategy** / decay math for backtest + live)
 - `template.yaml` (AWS SAM IaC)
 - `.env.example` (local environment variable template)
 
@@ -69,6 +72,7 @@ Additional parameters for backtesting pipeline:
 - `BacktestLakePrefix` (S3 prefix for buffered parquet data)
 - `BacktestEcrImageUri` (ECR image URI for Fargate backtester)
 - `BacktestSymbol` (symbol used by scheduled threshold optimization)
+- `EnableSentimentParquetSink` (`true`/`false`) — only enable when the stream→Parquet Lambda can be deployed (large dependency zip); otherwise keep `false` for lean deploys
 
 EventBridge schedule:
 - The cron expression uses UTC by default.
@@ -129,6 +133,7 @@ sam deploy \
 - Core sentiment: `sentiment_label`, `sentiment_score`, `rationale`
 - Timing: `news_published_at`, `market_price_timestamp`, `analyzed_at`, `triggered_at`
 - Price context: `market_price_at_news`, `market_session`, `is_regular_hours`, `market_price_lookup_start_at`
+- **GSI (time-series queries):** `gsi_pk` (uppercase symbol), `gsi_sk` (ISO timestamp for query range — aligns with `news_published_at` / analysis time). Used by `trade_executor` on **`TickerTimestampIndex`**.
 
 Market-session handling:
 
@@ -138,7 +143,29 @@ Market-session handling:
 
 ## Strategy-Based Trading
 
-`trade_executor` checks strategy config before placing orders.
+`trade_executor` loads **strategy config** from DynamoDB, builds a **`LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls **`check_live_signal(current_prices, current_news, ...)`** where:
+
+- **`current_news`**: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
+- **`current_prices`**: list of recent 1m bar dicts from Alpaca (`timestamp`, OHLCV); empty if data API creds are missing or the request fails (strategy is news-driven today).
+
+If `check_live_signal` returns a side, the handler calls **`_place_order`** (Alpaca) and writes the `TRADE` row as before.
+
+### Time-decayed sentiment (live)
+
+For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay \(w = e^{-\lambda t}\), \(t\) = age in hours:
+
+- **Primary window:** last **24 hours**, \(\lambda = 0.1\)
+- **Fallback:** if empty, last **7 days**, \(\lambda = 0.5\)
+- **No articles:** signal **0**
+
+Published times are parsed to **UTC** for age (`news_published_at` when present). Skip / threshold logs are emitted from inside the strategy’s `check_live_signal`.
+
+### Gates (inside `check_live_signal`, after the decayed signal is computed)
+
+1. **Magnitude:** `abs(decayed_signal) >= max(abs(SENTIMENT_BUY_THRESHOLD), abs(SENTIMENT_SELL_THRESHOLD))` — otherwise skip (too weak to treat as actionable).
+2. **Strategy row** (see below): `is_active` and `decayed_signal >= optimized_threshold` (long-biased gate before `_decide_side`).
+3. **Direction:** `SENTIMENT_BUY_THRESHOLD` / `SENTIMENT_SELL_THRESHOLD` (+ optional shorts) choose BUY vs SELL.
+4. **Close-only (optional):** if `TradeOnlyAtClose=true`, trading is only in the last `CloseWindowMinutes` of the regular session (default **5** minutes before close).
 
 Expected strategy item in DynamoDB:
 
@@ -147,15 +174,20 @@ Expected strategy item in DynamoDB:
 - Fields:
   - `is_active` (Boolean)
   - `optimized_threshold` (Decimal)
-
-Trading rule:
-
-- Only trade when:
-  - `is_active == true`, and
-  - `sentiment_score >= optimized_threshold`
-- If `TradeOnlyAtClose=true`, trading is additionally allowed only in the final `CloseWindowMinutes` of regular session (default: 5 minutes before close).
+  - `strategy_name` (String, e.g. `Sentiment_V1`) — must exist in `STRATEGY_MAP`
+  - `exit_type` (String: `fixed_time` | `end_of_day` | `signal_flip`)
+  - `hold_minutes` (Number) — used by `exit_manager` for `fixed_time`
 
 If strategy config is missing, defaults are conservative (`is_active=false`, threshold=`1.0`), so no accidental trade.
+
+### `TRADE` items (written by `trade_executor`, closed by `exit_manager`)
+
+- `item_type`: `TRADE`
+- `status`: `OPEN` → `CLOSED`
+- `exit_type`, `hold_minutes`, `strategy_name` (copied from strategy at entry)
+- On close: `closed_at`, `exit_reason`, `realized_pnl_usd` (Alpaca position `unrealized_pl` snapshot before flatten), `exit_alpaca_order_id`
+
+**Note:** `exit_manager` **scans** `item_type=TRADE` and filters `status=OPEN` in code (no extra GSI). For large tables, consider a dedicated GSI later.
 
 ## How retries & safety work
 
@@ -163,7 +195,7 @@ If strategy config is missing, defaults are conservative (`is_active=false`, thr
 - Each Lambda uses exponential backoff retry logic for its external API calls:
   - NewsAPI (news_fetcher)
   - Claude (sentiment_analyzer)
-  - Alpaca (trade_executor)
+  - Alpaca (trade_executor, exit_manager)
 - DynamoDB writes are idempotent per `run_id` and symbol:
   - Sentiment items use `batch_writer(overwrite_by_pkeys=["run_id","sort_key"])` for throughput and deterministic upsert on retries.
   - Trade execution writes `TRADE#<symbol>` records conditionally; if a trade record already exists, the executor skips it.
@@ -255,6 +287,17 @@ Default in SAM task definition:
 Cache behavior:
 - The backtester checks weekly symbol bars parquet in S3 first.
 - On cache miss, it fetches bars from Alpaca, writes parquet to S3 cache, and reuses it on future runs.
+
+**Strategy Pattern layout (`backtester/backtest_engine.py`):**
+- **`BaseStrategy`**: abstract `generate_signals(price_df, news_df) -> (entries, exits)` returning boolean pandas Series.
+- **`MorningSentimentStrategy`**: concrete strategy with existing 9:30 ET entries + 24h decayed sentiment (7d fallback) logic moved into the class.
+- **`exit_type`** supported by constructor: `fixed_time`, `end_of_day`, `signal_flip`.
+- **Threshold optimization** is generic: runner sets threshold, strategy generates signals, VectorBT evaluates.
+
+**Backtest env knobs:**
+- `BACKTEST_HOLD_MINUTES` (used by `fixed_time`)
+- `BACKTEST_EXIT_TYPE` (`fixed_time`, `end_of_day`, `signal_flip`)
+- `BACKTEST_MIN_SHARPE_IMPROVEMENT`
 
 It writes candidate results to DynamoDB as:
 - `run_id=BACKTEST#<SYMBOL>`

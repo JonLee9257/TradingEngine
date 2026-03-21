@@ -1,9 +1,21 @@
 import importlib.util
 import os
+import sys
 import unittest
 from decimal import Decimal
+from pathlib import Path
 
 from tests.stub_dependencies import install_stubs
+
+# Repo root so `strategies` resolves when loading `lambdas/trade_executor/app.py`.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+try:
+    import pandas  # noqa: F401
+except ImportError:
+    pandas = None
 
 
 def load_module_from_path(module_name: str, path: str):
@@ -28,7 +40,15 @@ class DummyTable:
         sort_key = key.get("sort_key", "")
         # Strategy config lookup
         if str(run_id).startswith("STRATEGY#") and sort_key == "LATEST":
-            return {"Item": {"is_active": True, "optimized_threshold": Decimal("0.3")}}
+            return {
+                "Item": {
+                    "is_active": True,
+                    "optimized_threshold": Decimal("0.3"),
+                    "strategy_name": "Sentiment_V1",
+                    "exit_type": "fixed_time",
+                    "hold_minutes": 60,
+                }
+            }
         # No existing trade record
         return {}
 
@@ -36,6 +56,7 @@ class DummyTable:
         self.put_calls.append({"Item": Item, "ConditionExpression": ConditionExpression})
 
 
+@unittest.skipUnless(pandas is not None, "pandas required (trade executor uses strategies package)")
 class TestTradeExecutor(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -66,7 +87,6 @@ class TestTradeExecutor(unittest.TestCase):
         # Avoid Alpaca calls: patch the trade client + order placement + P&L snapshot.
         self.mod._get_trade_client = lambda: object()  # type: ignore[attr-defined]
         self.mod._place_order = lambda **_kwargs: {"alpaca_order_id": "order-1", "submitted_at": "now"}  # type: ignore[attr-defined]
-        self.mod._decide_side = lambda **_kwargs: "BUY"  # type: ignore[attr-defined]
         self.mod._account_pnl_snapshot = lambda _tc: {  # type: ignore[attr-defined]
             "equity_usd": 100_000.0,
             "account_status_code": 2.0,
@@ -97,6 +117,10 @@ class TestTradeExecutor(unittest.TestCase):
         written_item = dummy_table.put_calls[-1]["Item"]
         self.assertIsInstance(written_item["sentiment_score"], Decimal)
         self.assertEqual(written_item["sentiment_score"], Decimal(str(0.5)))
+        self.assertEqual(written_item.get("strategy_name"), "Sentiment_V1")
+        self.assertEqual(written_item.get("exit_type"), "fixed_time")
+        self.assertEqual(written_item.get("status"), "OPEN")
+        self.assertIsNotNone(written_item.get("hold_minutes"))
 
 
 if __name__ == "__main__":

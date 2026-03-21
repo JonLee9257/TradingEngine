@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
       pandas \
       boto3 \
       pyarrow \
-      awswrangler
+      awswrangler \
+      alpaca-py
 
+COPY strategies /app/strategies
 COPY backtester/backtest_engine.py /app/backtest_engine.py
 
 CMD ["python", "/app/backtest_engine.py"]
