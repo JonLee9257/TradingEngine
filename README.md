@@ -3,12 +3,13 @@
 This project implements the requested pipeline using AWS serverless components and Python 3.12.
 
 Architecture:
+
 1. EventBridge cron triggers `news_fetcher` on weekdays at `09:30` (UTC by default).
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
 3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results + backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
-5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls **`strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with **`status=OPEN`**, **`hold_minutes`**, **`strategy_name`**, and **`exit_type`** for the exit manager.
-6. **`exit_manager`** (Lambda 4) runs on **EventBridge `rate(1 minute)`**: scans for **`TRADE` + `status=OPEN`**, then exits per **`exit_type`** — **`fixed_time`** (after `submitted_at + hold_minutes`), **`end_of_day`** (within `EXIT_EOD_WINDOW_MINUTES` of Alpaca close), or **`signal_flip`** (strategy **`check_live_signal`** side vs entry side). It submits a flattening market order on Alpaca and sets **`status=CLOSED`**, **`realized_pnl_usd`** (position `unrealized_pl` snapshot at exit), **`exit_alpaca_order_id`**, **`closed_at`**, **`exit_reason`**.
+5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls `**strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with `**status=OPEN**`, `**hold_minutes**`, `**strategy_name**`, and `**exit_type**` for the exit manager.
+6. `**exit_manager**` (Lambda 4) runs on **EventBridge `rate(1 minute)`**: scans for `**TRADE` + `status=OPEN**`, then exits per `**exit_type**` — `**fixed_time**` (after `submitted_at + hold_minutes`), `**end_of_day**` (within `EXIT_EOD_WINDOW_MINUTES` of Alpaca close), or `**signal_flip**` (strategy `**check_live_signal**` side vs entry side). It submits a flattening market order on Alpaca and sets `**status=CLOSED**`, `**realized_pnl_usd**` (position `unrealized_pl` snapshot at exit), `**exit_alpaca_order_id**`, `**closed_at**`, `**exit_reason**`.
 7. DynamoDB Streams triggers `sentiment_to_s3_parquet`, which appends new `SENTIMENT` rows into an S3 Parquet lake.
 8. A weekly EventBridge Scheduler job runs an ECS Fargate VectorBT backtest task to evaluate threshold quality.
 
@@ -60,6 +61,7 @@ aws secretsmanager create-secret \
 ```
 
 Then pass these secret names/ARNs as SAM parameters:
+
 - `NewsApiSecretId`
 - `AnthropicApiSecretId`
 - `AlpacaApiKeySecretId`
@@ -68,6 +70,7 @@ Then pass these secret names/ARNs as SAM parameters:
 Non-secret defaults (thresholds, schedule time, symbol list, etc.) are parameters in `template.yaml` and can be overridden.
 
 Additional parameters for backtesting pipeline:
+
 - `BacktestLakeBucketName` (S3 bucket for Parquet lake and exports)
 - `BacktestLakePrefix` (S3 prefix for buffered parquet data)
 - `BacktestEcrImageUri` (ECR image URI for Fargate backtester)
@@ -77,6 +80,7 @@ Additional parameters for backtesting pipeline:
 - `EnableSentimentParquetSink` (`true`/`false`) — only enable when the stream→Parquet Lambda can be deployed (large dependency zip); otherwise keep `false` for lean deploys
 
 EventBridge schedule:
+
 - The cron expression uses UTC by default.
 - If you need a different timezone, adjust `ScheduleHour` / `ScheduleMinute` parameters accordingly.
 
@@ -88,13 +92,14 @@ EventBridge schedule:
 sam build
 ```
 
-2. Deploy (example):
+1. Deploy (example):
 
 ```bash
 sam deploy --guided
 ```
 
 When prompted, provide the required secret id parameters:
+
 - `NewsApiSecretId` (example: `trading/newsapi`)
 - `AnthropicApiSecretId` (example: `trading/anthropic`)
 - `AlpacaApiKeySecretId` (example: `trading/alpaca-api-key`)
@@ -114,6 +119,7 @@ sam deploy \
 ```
 
 Force refresh tip:
+
 - If Secrets Manager values changed but `sam deploy` says "No changes to deploy", pass a new `ForceRefreshToken` value to force Lambda env refresh.
 
 ```bash
@@ -135,7 +141,7 @@ sam deploy \
 - Core sentiment: `sentiment_label`, `sentiment_score`, `rationale`
 - Timing: `news_published_at`, `market_price_timestamp`, `analyzed_at`, `triggered_at`
 - Price context: `market_price_at_news`, `market_session`, `is_regular_hours`, `market_price_lookup_start_at`
-- **GSI (time-series queries):** `gsi_pk` (uppercase symbol), `gsi_sk` (ISO timestamp for query range — aligns with `news_published_at` / analysis time). Used by `trade_executor` on **`TickerTimestampIndex`**.
+- **GSI (time-series queries):** `gsi_pk` (uppercase symbol), `gsi_sk` (ISO timestamp for query range — aligns with `news_published_at` / analysis time). Used by `trade_executor` on `**TickerTimestampIndex`**.
 
 Market-session handling:
 
@@ -145,19 +151,19 @@ Market-session handling:
 
 ## Strategy-Based Trading
 
-`trade_executor` loads **strategy config** from DynamoDB, builds a **`LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls **`check_live_signal(current_prices, current_news, ...)`** where:
+`trade_executor` loads **strategy config** from DynamoDB, builds a `**LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls `**check_live_signal(current_prices, current_news, ...)**` where:
 
-- **`current_news`**: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
-- **`current_prices`**: list of recent 1m bar dicts from Alpaca (`timestamp`, OHLCV); empty if data API creds are missing or the request fails (strategy is news-driven today).
+- `**current_news**`: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
+- `**current_prices**`: list of recent 1m bar dicts from Alpaca (`timestamp`, OHLCV); empty if data API creds are missing or the request fails (strategy is news-driven today).
 
-If `check_live_signal` returns a side, the handler calls **`_place_order`** (Alpaca) and writes the `TRADE` row as before.
+If `check_live_signal` returns a side, the handler calls `**_place_order**` (Alpaca) and writes the `TRADE` row as before.
 
 ### Time-decayed sentiment (live)
 
-For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay \(w = e^{-\lambda t}\), \(t\) = age in hours:
+For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay w = e^{-\lambda t}, t = age in hours:
 
-- **Primary window:** last **24 hours**, \(\lambda = 0.1\)
-- **Fallback:** if empty, last **7 days**, \(\lambda = 0.5\)
+- **Primary window:** last **24 hours**, \lambda = 0.1
+- **Fallback:** if empty, last **7 days**, \lambda = 0.5
 - **No articles:** signal **0**
 
 Published times are parsed to **UTC** for age (`news_published_at` when present). Skip / threshold logs are emitted from inside the strategy’s `check_live_signal`.
@@ -204,7 +210,7 @@ If strategy config is missing, defaults are conservative (`is_active=false`, thr
 
 ## CloudWatch P&L metrics (trade executor)
 
-After each successful `trade_executor` run, the Lambda logs an **Alpaca account snapshot** and (by default) calls **`PutMetricData`** so you can chart P&L in a dashboard.
+After each successful `trade_executor` run, the Lambda logs an **Alpaca account snapshot** and (by default) calls `**PutMetricData`** so you can chart P&L in a dashboard.
 
 - **Namespace:** `Trading/Paper` (override with SAM parameter `CloudWatchMetricNamespace`).
 - **Metric names:** PascalCase from the snapshot, e.g. `EquityUsd`, `DayPlUsd`, `DayPlPct`, `UnrealizedPlUsd`, `AccountStatusCode`.
@@ -235,11 +241,13 @@ Enable only when you intentionally want near-real-time triggering.
 ## DynamoDB -> S3 Data Lake
 
 `template.yaml` now enables:
+
 - DynamoDB PITR (`TradingTable`)
 - DynamoDB stream (`NEW_IMAGE`)
 - `SentimentToS3ParquetFunction` stream consumer
 
 The stream consumer writes appended parquet files partitioned by date under:
+
 - `s3://<BacktestLakeBucketName>/<BacktestLakePrefix>/`
 
 ## Native DynamoDB Export (on-demand)
@@ -254,17 +262,20 @@ python3 scripts/dynamodb_native_export.py \
 ```
 
 Notes:
+
 - Native export format is DynamoDB JSON.
 - `backtester/backtest_engine.py` supports this format via `S3_DDB_EXPORT_PREFIX`.
 
 ## Weekly Fargate Backtester
 
 Infra added in `template.yaml`:
+
 - ECS cluster: `BacktestCluster`
 - Task definition: `BacktestTaskDefinition` (`2 vCPU`, `4GB`)
 - Scheduler: `WeeklyBacktestSchedule` (`Sunday 23:00 UTC`, `FlexibleTimeWindow: OFF`)
 
 The schedule target uses `ecs:RunTask` and requires real VPC IDs. Replace placeholders before deploy:
+
 - `subnet-CHANGE_ME_A`, `subnet-CHANGE_ME_B`, `sg-CHANGE_ME`
 
 ### Build and push image (example)
@@ -277,43 +288,52 @@ docker build -f backtester/Dockerfile -t trading-backtester:latest .
 ### Backtester inputs
 
 `backtester/backtest_engine.py` accepts either:
+
 - `S3_PARQUET_PATH` (preferred, parquet dataset), or
 - `S3_DDB_EXPORT_PREFIX` (native export path; unmarshalled in code)
 
 For historical bars reuse, set:
+
 - `S3_BARS_CACHE_PREFIX` (example: `s3://<BacktestLakeBucketName>/bars-cache`)
 
 Default in SAM task definition:
+
 - `S3_BARS_CACHE_PREFIX=s3://<BacktestLakeBucketName>/bars-cache`
 
 Cache behavior:
+
 - The backtester checks weekly symbol bars parquet in S3 first.
 - On cache miss, it fetches bars from Alpaca, writes parquet to S3 cache, and reuses it on future runs.
 
 **Strategy Pattern layout (`backtester/backtest_engine.py`):**
-- **`BaseStrategy`**: abstract `generate_signals(price_df, news_df) -> (entries, exits)` returning boolean pandas Series.
-- **`MorningSentimentStrategy`**: concrete strategy with existing 9:30 ET entries + 24h decayed sentiment (7d fallback) logic moved into the class.
-- **`exit_type`** supported by constructor: `fixed_time`, `end_of_day`, `signal_flip`.
+
+- `**BaseStrategy`**: abstract `generate_signals(price_df, news_df) -> (entries, exits)` returning boolean pandas Series.
+- `**MorningSentimentStrategy**`: concrete strategy with existing 9:30 ET entries + 24h decayed sentiment (7d fallback) logic moved into the class.
+- `**exit_type**` supported by constructor: `fixed_time`, `end_of_day`, `signal_flip`.
 - **Threshold optimization** is generic: runner sets threshold, strategy generates signals, VectorBT evaluates.
 
 **Backtest env knobs:**
+
 - `BACKTEST_HOLD_MINUTES` (used by `fixed_time`)
 - `BACKTEST_EXIT_TYPE` (`fixed_time`, `end_of_day`, `signal_flip`)
 - `BACKTEST_MIN_SHARPE_IMPROVEMENT`
 
 It writes candidate results to DynamoDB as:
+
 - `run_id=BACKTEST#<SYMBOL>`
 - `sort_key=<UTC timestamp>`
 - `item_type=BACKTEST`
 
 **Hybrid promotion to `STRATEGY#<SYMBOL>/LATEST` (optional):** Set `STRATEGY_PROMOTION_ENABLED=true` on the ECS task (SAM: `BacktestStrategyPromotionEnabled=true`). After a **Sharpe improvement**, the job still writes `BACKTEST#…` first, then evaluates four gates on the **candidate threshold** and **symbol’s news sample** in the backtest window:
 
-| Gate | Rule |
-|------|------|
-| Min threshold | `new > 0.60` |
-| Max threshold | `new < 0.90` |
-| Max jump | if a prior `optimized_threshold` exists in DDB: `abs(new - old) < 0.15` |
-| Sample size | `articles > 20` (row count of the symbol’s `news_df`) |
+
+| Gate          | Rule                                                                    |
+| ------------- | ----------------------------------------------------------------------- |
+| Min threshold | `new > 0.60`                                                            |
+| Max threshold | `new < 0.90`                                                            |
+| Max jump      | if a prior `optimized_threshold` exists in DDB: `abs(new - old) < 0.15` |
+| Sample size   | `articles > 20` (row count of the symbol’s `news_df`)                   |
+
 
 If **any** gate fails: **no** update to `STRATEGY#LATEST`, structured **error logs**, and **SNS** to `STRATEGY_PROMOTION_ALERT_SNS_TOPIC_ARN` when set. Tunables: `STRATEGY_PROMOTION_MIN_THRESHOLD`, `STRATEGY_PROMOTION_MAX_THRESHOLD`, `STRATEGY_PROMOTION_MAX_JUMP`, `STRATEGY_PROMOTION_MIN_ARTICLES`. Set `STRATEGY_PROMOTE_SET_ACTIVE=true` only if you want promotion to force `is_active=true`; otherwise existing `is_active` is preserved (new rows default to inactive).
 
@@ -334,7 +354,7 @@ python3 scripts/seed_strategy_latest.py --symbols TSLA
 cp .env.example .env
 ```
 
-2. Update API keys in `.env`.
+1. Update API keys in `.env`.
 
 SAM local can load environment variables depending on how you invoke it; the Lambdas also attempt a best-effort `.env` load when `python-dotenv` is installed.
 
@@ -342,18 +362,20 @@ SAM local can load environment variables depending on how you invoke it; the Lam
 
 Two workflows live under `.github/workflows/`:
 
-| Workflow | When it runs | What it does |
-|----------|----------------|---------------|
-| **CI** (`ci.yml`) | Every push / PR to `main` or `master` | `sam validate`, `sam build`, unit tests — **no AWS credentials** needed. |
+
+| Workflow                  | When it runs                                 | What it does                                                                               |
+| ------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| **CI** (`ci.yml`)         | Every push / PR to `main` or `master`        | `sam validate`, `sam build`, unit tests — **no AWS credentials** needed.                   |
 | **Deploy** (`deploy.yml`) | **Actions → Deploy → Run workflow** (manual) | `sam build` + `sam deploy` using AWS **OIDC role assumption** (no long-lived access keys). |
+
 
 ### One-time setup for deploy
 
 1. In AWS IAM, create a role trusted by GitHub OIDC provider (`token.actions.githubusercontent.com`) with trust policy restricting your repo/branch (example below).
 2. Attach deploy permissions to that role (CloudFormation, Lambda, IAM pass role if needed, S3 artifacts, etc. — same permissions you use locally for `sam deploy`).
 3. In GitHub: **Settings → Secrets and variables → Actions → Variables**:
-   - `AWS_GITHUB_OIDC_ROLE_ARN` = `arn:aws:iam::<account-id>:role/<your-oidc-role>`
-   - optional `AWS_REGION` (default is `us-east-1` if omitted)
+  - `AWS_GITHUB_OIDC_ROLE_ARN` = `arn:aws:iam::<account-id>:role/<your-oidc-role>`
+  - optional `AWS_REGION` (default is `us-east-1` if omitted)
 4. **Commit `samconfig.toml`** from your machine (after `sam deploy --guided`) so CI/CD can deploy non-interactively — it should **not** contain API keys (those stay in Secrets Manager per this template). Or hard-code `--stack-name` and `--parameter-overrides` in `deploy.yml`.
 5. To deploy on every merge to `main`, edit `deploy.yml` and add a `push:` trigger (see comments in that file).
 
