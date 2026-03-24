@@ -32,8 +32,9 @@ def _window_stats_vectorized(
 
     Must stay in sync with historical backtest behavior.
     """
-    dec_ns = pd.to_datetime(decision_ts, utc=True, errors="coerce").view("int64").to_numpy()
-    art_ns = pd.to_datetime(article_ts, utc=True, errors="coerce").view("int64").to_numpy()
+    # Use DatetimeIndex.asi8 (int64 ns) — Series.view("int64") breaks on pandas 2.x.
+    dec_ns = pd.DatetimeIndex(pd.to_datetime(decision_ts, utc=True, errors="coerce")).asi8
+    art_ns = pd.DatetimeIndex(pd.to_datetime(article_ts, utc=True, errors="coerce")).asi8
     scores = article_scores.to_numpy(dtype=float)
 
     right = np.searchsorted(art_ns, dec_ns, side="left")

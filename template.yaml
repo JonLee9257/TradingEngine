@@ -129,6 +129,17 @@ Parameters:
     Type: String
     Default: TSLA
     Description: Symbol used by weekly threshold optimization task.
+  BacktestStrategyPromotionEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: When true, ECS backtester may update STRATEGY#<SYMBOL>/LATEST after Sharpe improvement if hybrid promotion gates pass.
+  StrategyPromotionAlertTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic ARN for strategy promotion approved/rejected alerts (empty disables SNS publish).
   EnableSentimentParquetSink:
     Type: String
     Default: 'false'
@@ -434,6 +445,10 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                 Resource: !GetAtt TradingTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*
 
   BacktestTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -466,6 +481,10 @@ Resources:
               Value: '60'
             - Name: BACKTEST_EXIT_TYPE
               Value: fixed_time
+            - Name: STRATEGY_PROMOTION_ENABLED
+              Value: !Ref BacktestStrategyPromotionEnabled
+            - Name: STRATEGY_PROMOTION_ALERT_SNS_TOPIC_ARN
+              Value: !Ref StrategyPromotionAlertTopicArn
           LogConfiguration:
             LogDriver: awslogs
             Options:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -35,6 +36,9 @@ if _bt_dir.name == "backtester":
 
 from strategies.base import BaseStrategy  # noqa: E402
 from strategies.sentiment_v1 import MorningSentimentStrategy  # noqa: E402
+from strategy_promotion_runner import maybe_promote_strategy_latest_after_backtest  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 _DESERIALIZER = TypeDeserializer()
 EASTERN_TZ = ZoneInfo("America/New_York")
@@ -314,6 +318,7 @@ def _current_strategy_threshold(table, symbol: str) -> float | None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     table_name = os.getenv("DYNAMODB_TABLE_NAME", "TradingNewsSentiment")
     symbol = os.getenv("BACKTEST_SYMBOL", "TSLA").upper()
     parquet_path = os.getenv("S3_PARQUET_PATH", "")
@@ -395,6 +400,20 @@ def main() -> None:
     }
     table.put_item(Item=item)
     print(f"Wrote backtest result: {item['run_id']} / {item['sort_key']}")
+
+    maybe_promote_strategy_latest_after_backtest(
+        table=table,
+        symbol=symbol,
+        new_threshold=new_threshold,
+        current_threshold=current_threshold,
+        new_sharpe=new_sharpe,
+        current_sharpe=current_sharpe,
+        article_count=int(len(news_df)),
+        strategy_name=getattr(strategy, "strategy_name", strategy.__class__.__name__),
+        exit_type=exit_type,
+        hold_minutes=hold_minutes,
+        backtest_sort_key=ts,
+    )
 
 
 if __name__ == "__main__":

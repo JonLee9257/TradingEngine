@@ -11,6 +11,6 @@ alwaysApply: true
 
 # Testing / validation after substantive edits
 
-- For Python logic changes: run `python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py`.
+- For Python logic changes: run `python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executor.py tests/test_strategy_promotion.py tests/test_strategy_promotion_runner.py tests/test_exit_manager.py` (install `pydantic` and `pandas` for the full set).
 - For `template.yaml` / IaC changes: run `sam validate --lint`.
 

@@ -72,6 +72,8 @@ Additional parameters for backtesting pipeline:
 - `BacktestLakePrefix` (S3 prefix for buffered parquet data)
 - `BacktestEcrImageUri` (ECR image URI for Fargate backtester)
 - `BacktestSymbol` (symbol used by scheduled threshold optimization)
+- `BacktestStrategyPromotionEnabled` (`true`|`false`) — when `true`, after a Sharpe improvement the backtester runs **hybrid promotion gates** and may update `STRATEGY#<SYMBOL>/LATEST`
+- `StrategyPromotionAlertTopicArn` — optional SNS topic for promotion approved / rejected notifications
 - `EnableSentimentParquetSink` (`true`/`false`) — only enable when the stream→Parquet Lambda can be deployed (large dependency zip); otherwise keep `false` for lean deploys
 
 EventBridge schedule:
@@ -303,6 +305,26 @@ It writes candidate results to DynamoDB as:
 - `run_id=BACKTEST#<SYMBOL>`
 - `sort_key=<UTC timestamp>`
 - `item_type=BACKTEST`
+
+**Hybrid promotion to `STRATEGY#<SYMBOL>/LATEST` (optional):** Set `STRATEGY_PROMOTION_ENABLED=true` on the ECS task (SAM: `BacktestStrategyPromotionEnabled=true`). After a **Sharpe improvement**, the job still writes `BACKTEST#…` first, then evaluates four gates on the **candidate threshold** and **symbol’s news sample** in the backtest window:
+
+| Gate | Rule |
+|------|------|
+| Min threshold | `new > 0.60` |
+| Max threshold | `new < 0.90` |
+| Max jump | if a prior `optimized_threshold` exists in DDB: `abs(new - old) < 0.15` |
+| Sample size | `articles > 20` (row count of the symbol’s `news_df`) |
+
+If **any** gate fails: **no** update to `STRATEGY#LATEST`, structured **error logs**, and **SNS** to `STRATEGY_PROMOTION_ALERT_SNS_TOPIC_ARN` when set. Tunables: `STRATEGY_PROMOTION_MIN_THRESHOLD`, `STRATEGY_PROMOTION_MAX_THRESHOLD`, `STRATEGY_PROMOTION_MAX_JUMP`, `STRATEGY_PROMOTION_MIN_ARTICLES`. Set `STRATEGY_PROMOTE_SET_ACTIVE=true` only if you want promotion to force `is_active=true`; otherwise existing `is_active` is preserved (new rows default to inactive).
+
+**Bootstrap `STRATEGY#…/LATEST` (Phase 1):**
+
+```bash
+pip install boto3 pydantic
+export DYNAMODB_TABLE_NAME=TradingNewsSentiment
+python3 scripts/seed_strategy_latest.py --symbols TSLA
+# optional: --active --threshold 0.65
+```
 
 ## Local Development (optional)
 
