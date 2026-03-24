@@ -24,7 +24,7 @@ import requests
 from anthropic import Anthropic
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 # `logger` writes logs to CloudWatch.
@@ -410,11 +410,41 @@ def _build_prompt(symbols: list[str], articles_by_symbol: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _clamp_decimal(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
+
+
+def _effective_sentiment(*, raw_score: Decimal, confidence: Decimal) -> Decimal:
+    """
+    Single combined score for downstream decay: direction × strength scaled by model confidence.
+    Applied once per symbol for the bundled articles in this run (not per headline row in DDB).
+    """
+    c = _clamp_decimal(confidence, Decimal("0"), Decimal("1"))
+    s = _clamp_decimal(raw_score, Decimal("-1"), Decimal("1"))
+    return _clamp_decimal(s * c, Decimal("-1"), Decimal("1"))
+
+
 class SentimentItem(BaseModel):
     symbol: str
     label: Literal["positive", "neutral", "negative"]
     score: Decimal
-    rationale: str
+    confidence: Decimal = Field(default=Decimal("1"))
+    rationale: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v: object) -> Decimal:
+        if v is None:
+            return Decimal("1")
+        if isinstance(v, Decimal):
+            d = v
+        else:
+            d = Decimal(str(v))
+        return _clamp_decimal(d, Decimal("0"), Decimal("1"))
 
 
 class SentimentResponse(BaseModel):
@@ -438,29 +468,32 @@ def _analyze_sentiment_with_claude(*, symbols: list[str], articles_by_symbol: di
 
     # `system_prompt` tells the model how to respond (JSON-only).
     system_prompt = (
-        "You are a trading sentiment analyst. "
+        "You are a senior financial analyst. "
         "You must respond with valid JSON only, matching the requested schema."
     )
 
     # Build the user prompt from the articles received in SQS.
     user_payload = _build_prompt(symbols=symbols, articles_by_symbol=articles_by_symbol)
     user_prompt = f"""
-Given news articles for each symbol, assign a sentiment score from -1 to 1 and a label.
+Act as a Senior Financial Analyst. Given news articles for each symbol,
+analyze the sentiment relative to market expectations.
 
 Rules:
-- Score > 0.2 => positive, Score < -0.2 => negative, otherwise neutral.
-- If there are no articles for a symbol, set score=0 and label="neutral".
-- Sentiment should reflect the overall tone of the provided articles.
-- Keep rationale to 1 short sentence.
+- Score: -1 to 1. (0.2+ Positive, -0.2- Negative).
+- Confidence: 0 to 1. (How certain are you that this news is a 'market mover'?)
+- Nuance: Distinguish between 'priced-in' news (expected) vs 'surprise' news (unexpected).
+- Noise: If the article is fluff, irrelevant, or non-financial, return a low confidence score (< 0.5).
+- If no articles: score=0, label="neutral", confidence=1.0.
 
-Return JSON ONLY in this shape:
+Return JSON ONLY:
 {{
   "results": [
     {{
       "symbol": "AAPL",
       "label": "positive|neutral|negative",
       "score": 0.0,
-      "rationale": "..."
+      "confidence": 0.0,
+      "rationale": "High surprise factor: earnings beat expectations despite supply chain rumors."
     }}
   ]
 }}
@@ -515,6 +548,7 @@ def _build_sentiment_item_payload(*, run_id: str, symbol: str, item: dict, sourc
         "symbol": symbol,
         "sentiment_label": item["label"],
         # DynamoDB/boto3 requires numbers to be Decimal (floats are not supported).
+        # `score` here is effective_sentiment (raw × confidence) for downstream decay.
         "sentiment_score": Decimal(str(item["score"])),
         "rationale": item.get("rationale") or "",
         "analyzed_at": now_iso,
@@ -522,6 +556,10 @@ def _build_sentiment_item_payload(*, run_id: str, symbol: str, item: dict, sourc
         "model": source.get("model"),
         "lambda_request_id": source.get("lambda_request_id"),
     }
+    # Secondary access path for time-window queries by symbol.
+    # ISO-8601 UTC lexical order matches chronological order.
+    payload["gsi_pk"] = symbol # symbol is the partition key for the global secondary index
+    payload["gsi_sk"] = item.get("news_published_at") or now_iso # news_published_at is the sort key for the global secondary index
     # Backtesting data-pipeline extension:
     # store point-in-time market price captured during sentiment processing.
     if item.get("market_price") is not None:
@@ -540,6 +578,10 @@ def _build_sentiment_item_payload(*, run_id: str, symbol: str, item: dict, sourc
         payload["is_regular_hours"] = bool(item.get("is_regular_hours"))
     if item.get("market_price_lookup_start_at"):
         payload["market_price_lookup_start_at"] = item.get("market_price_lookup_start_at")
+    if item.get("sentiment_raw_score") is not None:
+        payload["sentiment_raw_score"] = Decimal(str(item["sentiment_raw_score"]))
+    if item.get("sentiment_confidence") is not None:
+        payload["sentiment_confidence"] = Decimal(str(item["sentiment_confidence"]))
 
     return payload
 
@@ -640,21 +682,36 @@ def _process_one_record(record: dict, *, table, trade_executor_arn: str, lambda_
     for sym in symbols:
         item = by_symbol.get(sym)
         if not item:
-            item = {"symbol": sym, "label": "neutral", "score": 0.0, "rationale": "No analysis returned by model."}
-        # Coerce label/score.
+            item = {
+                "symbol": sym,
+                "label": "neutral",
+                "score": 0.0,
+                "confidence": Decimal("1"),
+                "rationale": "No analysis returned by model.",
+            }
+        # Coerce label/score/confidence.
         label = (item.get("label") or "neutral").strip().lower()
         if label not in ("positive", "neutral", "negative"):
             label = "neutral"
-        score_raw = item.get("score") or 0
-        if isinstance(score_raw, Decimal):
-            score = score_raw
+        score_raw = item.get("score")
+        if score_raw is None:
+            raw_score = Decimal("0")
+        elif isinstance(score_raw, Decimal):
+            raw_score = score_raw
         else:
-            # Ensure we never pass floats into DynamoDB/boto3.
-            score = Decimal(str(score_raw))
-        if score > Decimal("1"):
-            score = Decimal("1")
-        if score < Decimal("-1"):
-            score = Decimal("-1")
+            raw_score = Decimal(str(score_raw))
+        raw_score = _clamp_decimal(raw_score, Decimal("-1"), Decimal("1"))
+
+        conf_raw = item.get("confidence")
+        if conf_raw is None:
+            confidence = Decimal("1")
+        elif isinstance(conf_raw, Decimal):
+            confidence = conf_raw
+        else:
+            confidence = Decimal(str(conf_raw))
+        confidence = _clamp_decimal(confidence, Decimal("0"), Decimal("1"))
+
+        effective = _effective_sentiment(raw_score=raw_score, confidence=confidence)
         sym_articles = articles_by_symbol.get(sym) or []
         news_published_at = _representative_published_at(sym_articles)
         # Capture historical price near the news timestamp for backtesting.
@@ -692,24 +749,26 @@ def _process_one_record(record: dict, *, table, trade_executor_arn: str, lambda_
 
         sentiment_payloads.append(
             _build_sentiment_item_payload(
-            run_id=run_id,
-            symbol=sym,
-            item={
-                "label": label,
-                "score": score,
-                "rationale": item.get("rationale") or "",
-                "news_published_at": news_published_at,
-                "market_price_at_news": market_price_at_news,
-                "market_price_timestamp": market_price_timestamp,
-                "market_session": market_session,
-                "is_regular_hours": is_regular_hours,
-                "market_price_lookup_start_at": market_price_lookup_start_at,
-                "market_price": market_price,
-                "market_price_fetched_at": market_price_fetched_at,
-                "market_price_source": market_price_source,
-            },
-            source=source,
-        )
+                run_id=run_id,
+                symbol=sym,
+                item={
+                    "label": label,
+                    "score": effective,
+                    "sentiment_raw_score": raw_score,
+                    "sentiment_confidence": confidence,
+                    "rationale": item.get("rationale") or "",
+                    "news_published_at": news_published_at,
+                    "market_price_at_news": market_price_at_news,
+                    "market_price_timestamp": market_price_timestamp,
+                    "market_session": market_session,
+                    "is_regular_hours": is_regular_hours,
+                    "market_price_lookup_start_at": market_price_lookup_start_at,
+                    "market_price": market_price,
+                    "market_price_fetched_at": market_price_fetched_at,
+                    "market_price_source": market_price_source,
+                },
+                source=source,
+            )
         )
 
     # Batch-write sentiment rows after we build the full symbol payload set.
@@ -721,7 +780,7 @@ def _process_one_record(record: dict, *, table, trade_executor_arn: str, lambda_
 
 def handler(event, context):
     """
-    SQS consumer -> analyze sentiment with Claude -> store in DynamoDB -> invoke trade executor.
+    SQS consumer -> analyze sentiment with Claude -> store in DynamoDB -> invoke trade executor only at near close time.
     """
     # DynamoDB Table resource gives higher-level convenience methods.
     table = boto3.resource("dynamodb").Table(os.environ["DYNAMODB_TABLE_NAME"])

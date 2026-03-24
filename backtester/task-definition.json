@@ -16,7 +16,9 @@
         { "name": "S3_PARQUET_PATH", "value": "s3://<BUCKET>/sentiment-buffered/" },
         { "name": "S3_BARS_CACHE_PREFIX", "value": "s3://<BUCKET>/bars-cache" },
         { "name": "BACKTEST_SYMBOL", "value": "TSLA" },
-        { "name": "BACKTEST_MIN_SHARPE_IMPROVEMENT", "value": "0.10" }
+        { "name": "BACKTEST_MIN_SHARPE_IMPROVEMENT", "value": "0.10" },
+        { "name": "BACKTEST_HOLD_MINUTES", "value": "60" },
+        { "name": "BACKTEST_EXIT_TYPE", "value": "fixed_time" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

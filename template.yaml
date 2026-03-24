@@ -129,6 +129,17 @@ Parameters:
     Type: String
     Default: TSLA
     Description: Symbol used by weekly threshold optimization task.
+  BacktestStrategyPromotionEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: When true, ECS backtester may update STRATEGY#<SYMBOL>/LATEST after Sharpe improvement if hybrid promotion gates pass.
+  StrategyPromotionAlertTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic ARN for strategy promotion approved/rejected alerts (empty disables SNS publish).
   EnableSentimentParquetSink:
     Type: String
     Default: 'false'
@@ -171,14 +182,29 @@ Resources:
           AttributeType: S
         - AttributeName: sort_key
           AttributeType: S
+        - AttributeName: gsi_pk
+          AttributeType: S
+        - AttributeName: gsi_sk
+          AttributeType: S
       KeySchema:
         - AttributeName: run_id
           KeyType: HASH
         - AttributeName: sort_key
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: TickerTimestampIndex
+          KeySchema:
+            - AttributeName: gsi_pk
+              KeyType: HASH
+            - AttributeName: gsi_sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   TradeExecutorFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
     Properties:
       CodeUri: lambdas/trade_executor
       Handler: app.handler
@@ -211,6 +237,41 @@ Resources:
               Action:
                 - cloudwatch:PutMetricData
               Resource: '*'
+
+  ExitManagerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: lambdas/exit_manager
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDbTableName
+          STRATEGY_TABLE_NAME: !Ref DynamoDbTableName
+          ALPACA_API_KEY: !Sub '{{resolve:secretsmanager:${AlpacaApiKeySecretId}:SecretString:${AlpacaApiKeySecretJsonKey}}}'
+          ALPACA_SECRET_KEY: !Sub '{{resolve:secretsmanager:${AlpacaSecretKeySecretId}:SecretString:${AlpacaSecretKeySecretJsonKey}}}'
+          ALPACA_PAPER: 'true'
+          ENABLE_SHORTS: !Ref EnableShorts
+          SENTIMENT_BUY_THRESHOLD: !Ref SentimentBuyThreshold
+          SENTIMENT_SELL_THRESHOLD: !Ref SentimentSellThreshold
+          EXIT_EOD_WINDOW_MINUTES: !Ref CloseWindowMinutes
+          STRATEGY_HOLD_MINUTES: '60'
+          STRATEGY_EXIT_TYPE: fixed_time
+          LOG_LEVEL: !Ref LogLevel
+          FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTableName
+      Events:
+        ExitManagerEveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
 
   NewsFetcherFunction:
     Type: AWS::Serverless::Function
@@ -384,6 +445,10 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                 Resource: !GetAtt TradingTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*
 
   BacktestTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -412,6 +477,14 @@ Resources:
               Value: !Ref BacktestSymbol
             - Name: BACKTEST_MIN_SHARPE_IMPROVEMENT
               Value: '0.1'
+            - Name: BACKTEST_HOLD_MINUTES
+              Value: '60'
+            - Name: BACKTEST_EXIT_TYPE
+              Value: fixed_time
+            - Name: STRATEGY_PROMOTION_ENABLED
+              Value: !Ref BacktestStrategyPromotionEnabled
+            - Name: STRATEGY_PROMOTION_ALERT_SNS_TOPIC_ARN
+              Value: !Ref StrategyPromotionAlertTopicArn
           LogConfiguration:
             LogDriver: awslogs
             Options:

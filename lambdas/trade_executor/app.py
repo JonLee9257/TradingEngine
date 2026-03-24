@@ -4,26 +4,39 @@ Lambda 3: Trade Executor
 What it does:
 - Receives a `run_id` (invoked by the sentiment analyzer)
 - Looks up all SENTIMENT items for that run in DynamoDB
-- Converts sentiment scores into a trade decision (buy/sell/none)
+- Loads STRATEGY#<SYMBOL>/LATEST from DynamoDB and instantiates a registered strategy (STRATEGY_MAP)
+- Delegates buy/sell/none to ``strategy.check_live_signal(...)``
 - Places paper trades via Alpaca
 - Writes a TRADE record per symbol (idempotently) so retries don't duplicate orders
 """
 
+from __future__ import annotations
+
 import logging
 import os
+import sys
 import time
-from datetime import datetime, timezone
-from typing import Optional
-
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
+from typing import Any, Optional
 
 import boto3
+import requests
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AccountStatus, OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr, Key
 
+# Lambda zip (``sam build``) includes ``strategies/`` next to ``app.py``; local dev uses repo root.
+_here = Path(__file__).resolve().parent
+if not (_here / "strategies").is_dir():
+    _repo_root = _here.parent.parent
+    if (_repo_root / "strategies").is_dir() and str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+
+from strategies import STRATEGY_MAP, build_strategy_from_config  # noqa: E402
 
 # Logs go to CloudWatch.
 logger = logging.getLogger(__name__)
@@ -303,23 +316,6 @@ def _place_order(*, trading_client: TradingClient, symbol: str, side: OrderSide)
     raise RuntimeError(f"Alpaca order placement failed after {max_attempts} attempts: {last_err}")
 
 
-def _decide_side(
-    *, score: Decimal, buy_threshold: Decimal, sell_threshold: Decimal, enable_shorts: bool
-) -> Optional[OrderSide]:
-    """
-    Convert sentiment score to a trade decision.
-    Returns BUY if score >= buy_threshold, SELL if score <= sell_threshold (when shorts enabled),
-    or None for no trade.
-    """
-    if score >= buy_threshold:
-        return OrderSide.BUY
-    if score <= sell_threshold:
-        if not enable_shorts:
-            return None
-        return OrderSide.SELL
-    return None
-
-
 def _get_env_decimal(name: str, default: Decimal) -> Decimal:
     """Read a Decimal from environment variables, returning default if missing or invalid."""
     raw = os.getenv(name)
@@ -328,11 +324,121 @@ def _get_env_decimal(name: str, default: Decimal) -> Decimal:
     return Decimal(raw)
 
 
+def _query_sentiment_window(*, table, symbol: str, now_utc: datetime, window_hours: int) -> list[dict]:
+    index_name = os.getenv("TICKER_TIMESTAMP_GSI_NAME", "TickerTimestampIndex")
+    start_utc = now_utc - timedelta(hours=window_hours)
+    start_iso = start_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    kwargs = {
+        "IndexName": index_name,
+        "KeyConditionExpression": Key("gsi_pk").eq(symbol) & Key("gsi_sk").between(start_iso, end_iso),
+        "FilterExpression": Attr("item_type").eq("SENTIMENT"),
+    }
+    items: list[dict] = []
+    while True:
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items
+
+
+def _build_sentiment_news_rows(*, table, symbol: str, now_utc: datetime) -> list[dict[str, Any]]:
+    """
+    Load recent SENTIMENT rows for `symbol` (up to 7d) as row dicts for live strategies.
+    Same fields as DynamoDB items used by time-decay logic (DataFrame-compatible shape).
+    """
+    items = _query_sentiment_window(table=table, symbol=symbol, now_utc=now_utc, window_hours=24 * 7)
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append(
+            {
+                "sentiment_score": item.get("sentiment_score"),
+                "news_published_at": item.get("news_published_at"),
+                "analyzed_at": item.get("analyzed_at"),
+            }
+        )
+    return rows
+
+
+def _fetch_recent_price_bars(symbol: str) -> list[dict[str, Any]]:
+    """
+    Recent 1-minute bars for live strategy context (OHLCV, UTC timestamp per row).
+    Each row: timestamp (datetime UTC), open, high, low, close, volume.
+    Returns [] on missing creds or request failure (strategies may be news-only).
+    """
+    key = os.environ.get("ALPACA_API_KEY")
+    secret = os.environ.get("ALPACA_SECRET_KEY")
+    if not key or not secret:
+        logger.warning("Skipping price fetch: Alpaca data credentials missing", extra={"symbol": symbol})
+        return []
+
+    base_url = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+    feed = os.getenv("ALPACA_DATA_FEED", "iex")
+    timeout_s = float(os.getenv("ALPACA_PRICE_TIMEOUT_SECONDS", "20"))
+    end_utc = datetime.now(timezone.utc)
+    start_utc = end_utc - timedelta(days=2)
+
+    url = f"{base_url}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Min",
+        "start": start_utc.isoformat().replace("+00:00", "Z"),
+        "end": end_utc.isoformat().replace("+00:00", "Z"),
+        "limit": 10000,
+        "sort": "asc",
+        "adjustment": "raw",
+        "feed": feed,
+    }
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout_s)
+        resp.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Alpaca price bar fetch failed", extra={"symbol": symbol, "error": str(e)})
+        return []
+
+    bars = (resp.json() or {}).get("bars") or []
+    if not bars:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for b in bars:
+        ts_raw = b.get("t")
+        try:
+            ts_norm = str(ts_raw).replace("Z", "+00:00") if ts_raw else ""
+            ts = datetime.fromisoformat(ts_norm) if ts_norm else None
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts is not None:
+                ts = ts.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            ts = None
+        if ts is None:
+            continue
+        try:
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "open": float(b["o"]) if b.get("o") is not None else None,
+                    "high": float(b["h"]) if b.get("h") is not None else None,
+                    "low": float(b["l"]) if b.get("l") is not None else None,
+                    "close": float(b["c"]) if b.get("c") is not None else None,
+                    "volume": float(b["v"]) if b.get("v") is not None else None,
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda r: r["timestamp"])
+    return rows
+
+
 def _get_strategy_config(*, table, symbol: str) -> dict:
     """
     Read latest strategy config from DynamoDB:
       PK(run_id)=STRATEGY#<SYMBOL>, SK(sort_key)=LATEST
-    Returns {"is_active": bool, "optimized_threshold": Decimal}
+    Returns keys used by ``build_strategy_from_config`` / TRADE records.
     """
     key = {"run_id": f"STRATEGY#{symbol}", "sort_key": "LATEST"}
     item = table.get_item(Key=key).get("Item") or {}
@@ -349,7 +455,26 @@ def _get_strategy_config(*, table, symbol: str) -> dict:
         optimized_threshold = raw_threshold
     else:
         optimized_threshold = Decimal(str(raw_threshold))
-    return {"is_active": is_active, "optimized_threshold": optimized_threshold}
+
+    default_exit = os.getenv("STRATEGY_EXIT_TYPE", "fixed_time").strip() or "fixed_time"
+    raw_name = item.get("strategy_name")
+    strategy_name = str(raw_name).strip() if raw_name not in (None, "") else "Sentiment_V1"
+    exit_type = str(item.get("exit_type") or default_exit).strip() or default_exit
+    hm_raw = item.get("hold_minutes")
+    if hm_raw is None or hm_raw == "":
+        hold_minutes = int(os.getenv("STRATEGY_HOLD_MINUTES", "60"))
+    elif isinstance(hm_raw, Decimal):
+        hold_minutes = int(hm_raw)
+    else:
+        hold_minutes = int(hm_raw)
+
+    return {
+        "is_active": is_active,
+        "optimized_threshold": optimized_threshold,
+        "strategy_name": strategy_name,
+        "exit_type": exit_type,
+        "hold_minutes": hold_minutes,
+    }
 
 
 def _should_trade_now_close_only(trading_client: TradingClient) -> bool:
@@ -394,6 +519,9 @@ def handler(event, context):
     sell_threshold = _get_env_decimal("SENTIMENT_SELL_THRESHOLD", Decimal("-0.2"))
     enable_shorts = os.getenv("ENABLE_SHORTS", "false").lower() == "true"
 
+    # Registered strategies (for observability / validation).
+    logger.debug("Trade executor STRATEGY_MAP keys", extra={"strategies": sorted(STRATEGY_MAP.keys())})
+
     # Create Alpaca API client.
     trading_client = _get_trade_client()
     if not _should_trade_now_close_only(trading_client):
@@ -419,47 +547,55 @@ def handler(event, context):
     # Track whether we encountered errors; if yes, we raise so Lambda/SQS retry can happen.
     had_errors = False
     trades_submitted = 0
+    now_utc = datetime.now(timezone.utc)
 
     for it in items:
         symbol = (it.get("symbol") or "").strip().upper()
         if not symbol:
             continue
-        sentiment_score_raw = it.get("sentiment_score") or Decimal("0")
-        if isinstance(sentiment_score_raw, Decimal):
-            sentiment_score = sentiment_score_raw
-        else:
-            sentiment_score = Decimal(str(sentiment_score_raw))
 
         try:
-            strategy = _get_strategy_config(table=strategy_table, symbol=symbol)
+            strategy_config = _get_strategy_config(table=strategy_table, symbol=symbol)
         except Exception:  # noqa: BLE001
             logger.exception("Failed reading strategy config", extra={"run_id": run_id, "symbol": symbol})
             had_errors = True
             continue
-        if not strategy["is_active"]:
+
+        if not strategy_config["is_active"]:
             logger.info("Strategy inactive; skipping symbol", extra={"run_id": run_id, "symbol": symbol})
             continue
-        if sentiment_score < strategy["optimized_threshold"]:
-            logger.info(
-                "Sentiment score below optimized threshold; skipping symbol",
-                extra={
-                    "run_id": run_id,
-                    "symbol": symbol,
-                    "score": str(sentiment_score),
-                    "optimized_threshold": str(strategy["optimized_threshold"]),
-                },
+
+        try:
+            active_strategy = build_strategy_from_config(
+                strategy_config,
+                buy_threshold=buy_threshold,
+                sell_threshold=sell_threshold,
+                enable_shorts=enable_shorts,
             )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to build strategy from config", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
             continue
 
-        side = _decide_side(
-            score=sentiment_score,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
-            enable_shorts=enable_shorts,
-        )
-        if side is None:
-            logger.info("No trade decision for symbol", extra={"run_id": run_id, "symbol": symbol, "score": sentiment_score})
+        current_news = _build_sentiment_news_rows(table=table, symbol=symbol, now_utc=now_utc)
+        current_prices = _fetch_recent_price_bars(symbol)
+
+        try:
+            side = active_strategy.check_live_signal(
+                current_prices,
+                current_news,
+                run_id=run_id,
+                symbol=symbol,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Strategy check_live_signal failed", extra={"run_id": run_id, "symbol": symbol})
+            had_errors = True
             continue
+
+        if side is None:
+            continue
+
+        sentiment_score = active_strategy.last_sentiment_score
 
         trade_sort_key = f"TRADE#{symbol}"
 
@@ -475,7 +611,10 @@ def handler(event, context):
             had_errors = True
             continue
 
-        logger.info("Submitting paper trade", extra={"run_id": run_id, "symbol": symbol, "side": str(side), "score": sentiment_score})
+        logger.info(
+            "Submitting paper trade",
+            extra={"run_id": run_id, "symbol": symbol, "side": str(side), "score": str(sentiment_score)},
+        )
 
         try:
             # Actually place the order with Alpaca.
@@ -492,6 +631,10 @@ def handler(event, context):
                 "sentiment_score": Decimal(str(sentiment_score)),
                 "sentiment_label": it.get("sentiment_label") or "neutral",
                 "side": str(side),
+                "strategy_name": getattr(active_strategy, "strategy_name", type(active_strategy).__name__),
+                "exit_type": str(getattr(active_strategy, "exit_type", "fixed_time")),
+                "hold_minutes": Decimal(str(int(getattr(active_strategy, "hold_minutes", 60)))),
+                "status": "OPEN",
                 "alpaca_order_id": order_result.get("alpaca_order_id") or "",
                 "submitted_at": order_result.get("submitted_at"),
                 "trade_attempted_by": getattr(context, "aws_request_id", None),
