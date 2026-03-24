@@ -6,7 +6,7 @@ Architecture:
 
 1. EventBridge cron triggers `news_fetcher` on weekdays at `09:30` (UTC by default).
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
-3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) to score sentiment, and stores results + backtesting price context in DynamoDB.
+3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) for **per-symbol** sentiment (`score` in [-1, 1], `confidence` in [0, 1]) over the headlines in the prompt, computes **`effective_sentiment = score × confidence`** (clamped), stores that as **`sentiment_score`**, and persists raw score + confidence for audit. It also stores backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
 5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls `**strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with `**status=OPEN**`, `**hold_minutes**`, `**strategy_name**`, and `**exit_type**` for the exit manager.
 6. `**exit_manager**` (Lambda 4) runs on **EventBridge `rate(1 minute)`**: scans for `**TRADE` + `status=OPEN**`, then exits per `**exit_type**` — `**fixed_time**` (after `submitted_at + hold_minutes`), `**end_of_day**` (within `EXIT_EOD_WINDOW_MINUTES` of Alpaca close), or `**signal_flip**` (strategy `**check_live_signal**` side vs entry side). It submits a flattening market order on Alpaca and sets `**status=CLOSED**`, `**realized_pnl_usd**` (position `unrealized_pl` snapshot at exit), `**exit_alpaca_order_id**`, `**closed_at**`, `**exit_reason**`.
@@ -138,7 +138,12 @@ sam deploy \
 
 `sentiment_analyzer` stores one `SENTIMENT#<symbol>` item per symbol/run with fields for backtesting:
 
-- Core sentiment: `sentiment_label`, `sentiment_score`, `rationale`
+- Core sentiment:
+  - `sentiment_score` — **effective** value used everywhere downstream (time decay, `check_live_signal`, backtest lake): **`model_score × confidence`**, clamped to [-1, 1]. The field name is unchanged so `trade_executor`, `exit_manager`, and `Sentiment_V1` keep reading the same attribute.
+  - `sentiment_raw_score` — Claude’s directional **score** before confidence scaling (audit / research).
+  - `sentiment_confidence` — Claude’s **confidence** [0, 1] (how much to trust the call as a market mover; fluff / non-financial news should land low per prompt rules).
+  - `sentiment_label`, `rationale`
+- **Claude contract:** The prompt asks for sentiment **relative to market expectations** (priced-in vs surprise), a **confidence** per symbol for the **bundle** of articles in that request, and JSON matching the structured schema in `lambdas/sentiment_analyzer/app.py`. There is still **one** aggregated result per symbol per run, not one Dynamo row per headline.
 - Timing: `news_published_at`, `market_price_timestamp`, `analyzed_at`, `triggered_at`
 - Price context: `market_price_at_news`, `market_session`, `is_regular_hours`, `market_price_lookup_start_at`
 - **GSI (time-series queries):** `gsi_pk` (uppercase symbol), `gsi_sk` (ISO timestamp for query range — aligns with `news_published_at` / analysis time). Used by `trade_executor` on `**TickerTimestampIndex`**.
@@ -153,14 +158,14 @@ Market-session handling:
 
 `trade_executor` loads **strategy config** from DynamoDB, builds a `**LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls `**check_live_signal(current_prices, current_news, ...)**` where:
 
-- `**current_news**`: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
+- `**current_news**`: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`, and optionally `sentiment_raw_score` / `sentiment_confidence`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
 - `**current_prices**`: list of recent 1m bar dicts from Alpaca (`timestamp`, OHLCV); empty if data API creds are missing or the request fails (strategy is news-driven today).
 
 If `check_live_signal` returns a side, the handler calls `**_place_order**` (Alpaca) and writes the `TRADE` row as before.
 
 ### Time-decayed sentiment (live)
 
-For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay w = e^{-\lambda t}, t = age in hours:
+For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay w = e^{-\lambda t}, t = age in hours. Each row’s weight is applied to **`sentiment_score`** (the **effective** score); **`sentiment_raw_score`** / **`sentiment_confidence`** are not inputs to the decay math unless you extend the strategy.
 
 - **Primary window:** last **24 hours**, \lambda = 0.1
 - **Fallback:** if empty, last **7 days**, \lambda = 0.5
@@ -423,7 +428,7 @@ python3 -m unittest -q tests/test_sentiment_analyzer.py tests/test_trade_executo
 `analysis/backtest_report.py` helps with threshold research:
 
 - scans DynamoDB `item_type=SENTIMENT`
-- reads `sentiment_score` + `market_price_at_news`
+- reads `sentiment_score` (effective) + `market_price_at_news` (optional: also `sentiment_raw_score` / `sentiment_confidence` if present in your table export)
 - fetches Alpaca closes at `+15m` and `+60m`
 - prints average return by sentiment-score bucket
 

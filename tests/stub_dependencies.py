@@ -18,7 +18,18 @@ def install_stubs() -> None:
         class BaseModel:  # noqa: D401 - minimal stub
             pass
 
+        def Field(**_kwargs):  # noqa: N802 - matches pydantic API
+            return None
+
+        def field_validator(*_args, **_kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
         pydantic_stub.BaseModel = BaseModel
+        pydantic_stub.Field = Field
+        pydantic_stub.field_validator = field_validator
         sys.modules["pydantic"] = pydantic_stub
 
     # ---- boto3 ----

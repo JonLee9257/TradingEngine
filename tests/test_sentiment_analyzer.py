@@ -58,6 +58,33 @@ class TestSentimentAnalyzer(unittest.TestCase):
         self.assertEqual(written["sentiment_label"], "positive")
         self.assertEqual(written["rationale"], "good news")
 
+    def test_build_sentiment_item_payload_stores_raw_and_confidence(self):
+        written = self.mod._build_sentiment_item_payload(
+            run_id="run-1",
+            symbol="AAPL",
+            item={
+                "label": "positive",
+                "score": Decimal("0.25"),
+                "sentiment_raw_score": Decimal("0.5"),
+                "sentiment_confidence": Decimal("0.5"),
+                "rationale": "ok",
+            },
+            source={"triggered_at": "t", "model": "m", "lambda_request_id": "req-1"},
+        )
+        self.assertEqual(written["sentiment_score"], Decimal("0.25"))
+        self.assertEqual(written["sentiment_raw_score"], Decimal("0.5"))
+        self.assertEqual(written["sentiment_confidence"], Decimal("0.5"))
+
+    def test_effective_sentiment_multiplies_and_clamps(self):
+        self.assertEqual(
+            self.mod._effective_sentiment(raw_score=Decimal("0.8"), confidence=Decimal("0.5")),
+            Decimal("0.4"),
+        )
+        self.assertEqual(
+            self.mod._effective_sentiment(raw_score=Decimal("-1"), confidence=Decimal("1")),
+            Decimal("-1"),
+        )
+
     def test_build_sentiment_item_payload_stores_market_price_fields(self):
         written = self.mod._build_sentiment_item_payload(
             run_id="run-1",
@@ -116,6 +143,7 @@ class TestSentimentAnalyzer(unittest.TestCase):
                                 "symbol": "AAPL",
                                 "label": "positive",
                                 "score": 0.3,
+                                "confidence": 0.5,
                                 "rationale": "ok",
                             }
                         ]
