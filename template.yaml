@@ -201,10 +201,17 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  StrategiesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-strategies'
+      Description: Shared strategies package (python/strategies) for trading Lambdas
+      ContentUri: layers/strategies/
+      CompatibleRuntimes:
+        - python3.12
+
   TradeExecutorFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: makefile
     Properties:
       CodeUri: lambdas/trade_executor
       Handler: app.handler
@@ -229,6 +236,8 @@ Resources:
           FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
           PUBLISH_CLOUDWATCH_METRICS: !Ref PublishCloudWatchMetrics
           CLOUDWATCH_METRIC_NAMESPACE: !Ref CloudWatchMetricNamespace
+      Layers:
+        - !Ref StrategiesLayer
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DynamoDbTableName
@@ -240,8 +249,6 @@ Resources:
 
   ExitManagerFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: makefile
     Properties:
       CodeUri: lambdas/exit_manager
       Handler: app.handler
@@ -263,6 +270,8 @@ Resources:
           STRATEGY_EXIT_TYPE: fixed_time
           LOG_LEVEL: !Ref LogLevel
           FORCE_REFRESH_TOKEN: !Ref ForceRefreshToken
+      Layers:
+        - !Ref StrategiesLayer
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DynamoDbTableName

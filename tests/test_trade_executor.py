@@ -4,15 +4,9 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 from unittest.mock import patch
 
 from tests.stub_dependencies import install_stubs
-
-# Repo root so `strategies` resolves when loading `lambdas/trade_executor/app.py`.
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 try:
     import pandas  # noqa: F401

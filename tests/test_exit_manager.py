@@ -4,7 +4,6 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 
 from tests.stub_dependencies import install_stubs
 
@@ -12,11 +11,6 @@ try:
     import pandas  # noqa: F401
 except ImportError:
     pandas = None
-
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 
 def load_module_from_path(module_name: str, path: str):
     spec = importlib.util.spec_from_file_location(module_name, path)

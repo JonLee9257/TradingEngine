@@ -29,4 +29,4 @@ A **markdown plan** listing:
 ### STYLE
 
 - Be concise but complete; prefer tables or numbered flows for clarity.
-- Align proposals with this repo’s conventions: SAM `template.yaml`, Dynamo keys (`run_id`, `sort_key`), GSI usage, `strategies/` and shared packages where applicable.
+- Align proposals with this repo’s conventions: SAM `template.yaml`, Dynamo keys (`run_id`, `sort_key`), GSI usage, `layers/strategies/` (Lambda layer) and shared packages where applicable.
