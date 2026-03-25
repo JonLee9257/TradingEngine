@@ -23,7 +23,7 @@ Architecture:
 - `analysis/backtest_report.py` (scan SENTIMENT data + forward returns report)
 - `scripts/dynamodb_native_export.py` (enable PITR + start native export to S3)
 - `backtester/` (Dockerized VectorBT engine + ECS task definition template)
-- `strategies/` (shared **BaseStrategy** + **MorningSentimentStrategy** / decay math for backtest + live)
+- `layers/strategies/python/strategies/` (shared **BaseStrategy** + **MorningSentimentStrategy** — packaged as **Lambda layer** `StrategiesLayer` for `trade_executor` / `exit_manager`; Fargate backtest image copies the same tree to `/app/strategies`)
 - `template.yaml` (AWS SAM IaC)
 - `.env.example` (local environment variable template)
 
@@ -90,6 +90,14 @@ EventBridge schedule:
 
 ```bash
 sam build
+```
+
+`TradeExecutorFunction` and `ExitManagerFunction` attach **`StrategiesLayer`**, whose content is `layers/strategies/` (zip layout `python/strategies/...`). No per-function Makefile is required, and `sam build --use-container` only needs each function’s `CodeUri` directory.
+
+**Local Python** (e.g. running `backtester/backtest_engine.py` on your machine): put the layer’s `python` folder on `PYTHONPATH`:
+
+```bash
+export PYTHONPATH="${PWD}/layers/strategies/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 1. Deploy (example):

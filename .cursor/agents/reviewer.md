@@ -36,4 +36,4 @@ Direct and specific. No generic praise. Assume the author wants to ship safely.
 
 ### REPO CONTEXT (this project)
 
-Pay extra attention to: **`template.yaml`** secrets references, **`lambdas/*`** handlers, **`strategies/`**, **DynamoDB** access patterns, **SQS** redrive, and **Makefile**-bundled dependencies for Lambdas.
+Pay extra attention to: **`template.yaml`** secrets references, **`lambdas/*`** handlers, **`layers/strategies/`** (Lambda layer for shared strategies), **DynamoDB** access patterns, and **SQS** redrive.

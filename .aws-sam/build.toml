@@ -27,4 +27,22 @@ manifest_hash = ""
 packagetype = "Zip"
 functions = ["SentimentAnalyzerFunction"]
 
+[function_build_definitions.016bb103-7688-45fc-9d6e-b9337bd4ce36]
+codeuri = "/Users/jonathanoh/Documents/Project/lambdas/exit_manager"
+runtime = "python3.12"
+architecture = "x86_64"
+handler = "app.handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["ExitManagerFunction"]
+
+[function_build_definitions.016ab532-b6dc-4044-a9ee-ce8bf1851e83]
+codeuri = "/Users/jonathanoh/Documents/Project/lambdas/sentiment_to_s3_parquet"
+runtime = "python3.12"
+architecture = "x86_64"
+handler = "app.handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["SentimentToS3ParquetFunction"]
+
 [layer_build_definitions]

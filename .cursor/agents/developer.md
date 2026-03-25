@@ -26,4 +26,4 @@ Take the **approved implementation plan** (from the **architect** subagent, a de
 
 ### REPO CONTEXT (this project)
 
-Prefer existing patterns: **boto3**, **SAM**, **Lambda + SQS**, **DynamoDB** keys (`run_id`, `sort_key`), **`strategies/`** for trading logic, **Makefile**-bundled Lambdas where present.
+Prefer existing patterns: **boto3**, **SAM**, **Lambda + SQS**, **DynamoDB** keys (`run_id`, `sort_key`), **`layers/strategies/python/strategies/`** (attached as **StrategiesLayer** on trading Lambdas).

@@ -29,8 +29,9 @@ from botocore.exceptions import ClientError
 _here = Path(__file__).resolve().parent
 if not (_here / "strategies").is_dir():
     _repo_root = _here.parent.parent
-    if (_repo_root / "strategies").is_dir() and str(_repo_root) not in sys.path:
-        sys.path.insert(0, str(_repo_root))
+    _layer_python = _repo_root / "layers" / "strategies" / "python"
+    if _layer_python.is_dir() and str(_layer_python) not in sys.path:
+        sys.path.insert(0, str(_layer_python))
 
 from strategies import build_strategy_from_config  # noqa: E402
 
