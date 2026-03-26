@@ -41,11 +41,23 @@ jobs:
         run: sam build --use-container
 
       - name: SAM deploy
+        env:
+          # Required template parameters (no Defaults in template.yaml). Values default to README
+          # examples; set repo Variables to override per account.
+          NEWS_API_SECRET_ID: ${{ vars.NEWS_API_SECRET_ID || 'trading/newsapi' }}
+          ANTHROPIC_API_SECRET_ID: ${{ vars.ANTHROPIC_API_SECRET_ID || 'trading/anthropic' }}
+          ALPACA_API_KEY_SECRET_ID: ${{ vars.ALPACA_API_KEY_SECRET_ID || 'trading/alpaca-api-key' }}
+          ALPACA_SECRET_KEY_SECRET_ID: ${{ vars.ALPACA_SECRET_KEY_SECRET_ID || 'trading/alpaca-secret-key' }}
+          BACKTEST_LAKE_BUCKET: ${{ vars.BACKTEST_LAKE_BUCKET_NAME || 'trading-backtest-lake-365953917399-us-east-1' }}
         run: |
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --resolve-s3 \
             --capabilities CAPABILITY_IAM \
-            --parameter-overrides BacktestLakeBucketName="trading-backtest-lake-365953917399-us-east-1"
-        # Commit samconfig.toml (no secrets in it) or pass --stack-name / --parameter-overrides here.
+            --parameter-overrides \
+              "NewsApiSecretId=${NEWS_API_SECRET_ID}" \
+              "AnthropicApiSecretId=${ANTHROPIC_API_SECRET_ID}" \
+              "AlpacaApiKeySecretId=${ALPACA_API_KEY_SECRET_ID}" \
+              "AlpacaSecretKeySecretId=${ALPACA_SECRET_KEY_SECRET_ID}" \
+              "BacktestLakeBucketName=${BACKTEST_LAKE_BUCKET}"

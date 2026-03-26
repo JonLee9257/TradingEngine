@@ -1,5 +1,9 @@
 version = 0.1
 
+# Deploy metadata only. Stack parameters use defaults from template.yaml unless you
+# pass --parameter-overrides on the CLI, or override from GitHub Actions (deploy.yml).
+# Duplicating thresholds/model/symbols here drifted from template defaults in the past.
+
 [default.deploy.parameters]
 stack_name = "trading-system-paper"
 resolve_s3 = true
@@ -8,7 +12,6 @@ region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 disable_rollback = true
-parameter_overrides = "ScheduleHour=\"9\" ScheduleMinute=\"30\" TopSymbols=\"AAPL,MSFT,NVDA,AMZN,TSLA,GOOGL,META,AMD,INTC,PLTR\" AnthropicModel=\"claude-3-5-sonnet-latest\" DynamoDbTableName=\"TradingNewsSentiment\" ArticlesPerSymbol=\"3\" NewsLookbackHours=\"24\" SentimentBuyThreshold=\"0.2\" SentimentSellThreshold=\"-0.2\" EnableShorts=\"false\" TradeNotionalUsd=\"1000\" TradeQty=\"\" LogLevel=\"INFO\" BacktestLakeBucketName=\"trading-backtest-lake-365953917399-us-east-1\""
 image_repositories = []
 
 [default.global.parameters]
