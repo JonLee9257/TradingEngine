@@ -104,7 +104,7 @@ export PYTHONPATH="${PWD}/layers/strategies/python${PYTHONPATH:+:$PYTHONPATH}"
 
 - **`template.yaml`** holds parameter **`Default`** values (e.g. `AnthropicModel`, thresholds, `TopSymbols`). Change behavior here first.
 - **`samconfig.toml`** should only carry **deploy metadata** (stack name, region, capabilities—not a long `parameter_overrides` string that duplicates the template and drifts).
-- **GitHub Actions** (`.github/workflows/deploy.yml`) passes **required** parameters that have **no** `Default` in the template (secret ids, `BacktestLakeBucketName`). Set optional repo **Variables** (`NEWS_API_SECRET_ID`, `BACKTEST_LAKE_BUCKET_NAME`, etc.) if yours differ from the README examples; otherwise the workflow uses those example ids/bucket names.
+- **GitHub Actions** (`.github/workflows/deploy.yml`) passes **required** parameters (secret ids, `BacktestLakeBucketName`) and **`AnthropicModel`** (defaults to `claude-haiku-4-5-20251001` so the stack does not keep a stale retired model id). Override with repo Variable **`ANTHROPIC_MODEL`** if needed.
 
 **Existing stacks:** CloudFormation **keeps** the previous value for any parameter you omit on `sam deploy`. Editing `Default` in `template.yaml` does **not** automatically change live Lambdas until you pass that parameter once (or change it in the console / a changeset).
 

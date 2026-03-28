@@ -456,7 +456,7 @@ def _analyze_sentiment_with_claude(*, symbols: list[str], articles_by_symbol: di
     api_key = os.environ["ANTHROPIC_API_KEY"]
     model = os.getenv("ANTHROPIC_MODEL", "")
     if not model:
-        raise ValueError("ANTHROPIC_MODEL is not set. Example: claude-3-5-sonnet-latest")
+        raise ValueError("ANTHROPIC_MODEL is not set. Example: claude-haiku-4-5-20251001")
 
     # Control inference behavior.
     max_attempts = int(os.getenv("ANTHROPIC_MAX_ATTEMPTS", "3"))

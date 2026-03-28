@@ -49,6 +49,8 @@ jobs:
           ALPACA_API_KEY_SECRET_ID: ${{ vars.ALPACA_API_KEY_SECRET_ID || 'trading/alpaca-api-key' }}
           ALPACA_SECRET_KEY_SECRET_ID: ${{ vars.ALPACA_SECRET_KEY_SECRET_ID || 'trading/alpaca-secret-key' }}
           BACKTEST_LAKE_BUCKET: ${{ vars.BACKTEST_LAKE_BUCKET_NAME || 'trading-backtest-lake-365953917399-us-east-1' }}
+          # Must be passed explicitly or CloudFormation keeps the previous stack value (e.g. retired -latest ids).
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001' }}
         run: |
           sam deploy \
             --no-confirm-changeset \
@@ -60,4 +62,5 @@ jobs:
               "AnthropicApiSecretId=${ANTHROPIC_API_SECRET_ID}" \
               "AlpacaApiKeySecretId=${ALPACA_API_KEY_SECRET_ID}" \
               "AlpacaSecretKeySecretId=${ALPACA_SECRET_KEY_SECRET_ID}" \
-              "BacktestLakeBucketName=${BACKTEST_LAKE_BUCKET}"
+              "BacktestLakeBucketName=${BACKTEST_LAKE_BUCKET}" \
+              "AnthropicModel=${ANTHROPIC_MODEL}"
