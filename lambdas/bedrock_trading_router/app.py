@@ -58,6 +58,27 @@ def _region() -> str:
     return _env("AWS_REGION", "us-east-1")
 
 
+def _coerce_session_for_bedrock(raw: Any) -> dict[str, str]:
+    """
+    Bedrock Agents expect sessionAttributes / promptSessionAttributes as string→string maps.
+    Non-strings (nested dicts, numbers) cause: "error processing the Lambda response".
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            out[key] = v
+        elif isinstance(v, (bool, int, float)):
+            out[key] = str(v)
+        else:
+            out[key] = json.dumps(v, default=str)
+    return out
+
+
 def _props_list_to_dict(properties: list[dict[str, Any]] | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for p in properties or []:
@@ -154,28 +175,28 @@ def _bedrock_openapi_success(
     *,
     http_status: int,
     payload_obj: dict[str, Any],
-    session_attributes: dict[str, str],
-    prompt_session_attributes: dict[str, str],
+    session_attributes: dict[str, Any],
+    prompt_session_attributes: dict[str, Any],
 ) -> dict[str, Any]:
     """Amazon Bedrock OpenAPI action group success: body must be a JSON *string*."""
-    body_str = json.dumps(payload_obj, default=str)
+    body_str = json.dumps(payload_obj, default=str, ensure_ascii=False)
     response_body = {
         "application/json": {
             "body": body_str,
         }
     }
     action_response = {
-        "actionGroup": event.get("actionGroup", ""),
-        "apiPath": event.get("apiPath", ""),
-        "httpMethod": event.get("httpMethod", ""),
-        "httpStatusCode": http_status,
+        "actionGroup": event.get("actionGroup") or "",
+        "apiPath": event.get("apiPath") or "",
+        "httpMethod": event.get("httpMethod") or "",
+        "httpStatusCode": int(http_status),
         "responseBody": response_body,
     }
     return {
         "messageVersion": "1.0",
         "response": action_response,
-        "sessionAttributes": session_attributes,
-        "promptSessionAttributes": prompt_session_attributes,
+        "sessionAttributes": _coerce_session_for_bedrock(session_attributes),
+        "promptSessionAttributes": _coerce_session_for_bedrock(prompt_session_attributes),
     }
 
 
@@ -184,8 +205,8 @@ def _bedrock_openapi_error(
     *,
     http_status: int,
     message: str,
-    session_attributes: dict[str, str],
-    prompt_session_attributes: dict[str, str],
+    session_attributes: dict[str, Any],
+    prompt_session_attributes: dict[str, Any],
 ) -> dict[str, Any]:
     err_obj = {"ok": False, "error": message}
     return _bedrock_openapi_success(
@@ -201,17 +222,17 @@ def _bedrock_function_success(
     event: dict[str, Any],
     *,
     payload_obj: dict[str, Any],
-    session_attributes: dict[str, str],
-    prompt_session_attributes: dict[str, str],
+    session_attributes: dict[str, Any],
+    prompt_session_attributes: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Function-details action group success: TEXT body with JSON string (docs allow TEXT content type).
     Omit responseState on success (only FAILURE | REPROMPT are documented for errors).
     """
-    body_str = json.dumps(payload_obj, default=str)
+    body_str = json.dumps(payload_obj, default=str, ensure_ascii=False)
     function_response = {
-        "actionGroup": event.get("actionGroup", ""),
-        "function": event.get("function", ""),
+        "actionGroup": event.get("actionGroup") or "",
+        "function": event.get("function") or "",
         "functionResponse": {
             "responseBody": {
                 "TEXT": {
@@ -223,8 +244,8 @@ def _bedrock_function_success(
     return {
         "messageVersion": "1.0",
         "response": function_response,
-        "sessionAttributes": session_attributes,
-        "promptSessionAttributes": prompt_session_attributes,
+        "sessionAttributes": _coerce_session_for_bedrock(session_attributes),
+        "promptSessionAttributes": _coerce_session_for_bedrock(prompt_session_attributes),
     }
 
 
@@ -480,14 +501,14 @@ def _route_function(event: dict[str, Any], context: Any) -> dict[str, Any]:
 def _bedrock_function_error(
     event: dict[str, Any],
     message: str,
-    session_attributes: dict[str, str],
-    prompt_session_attributes: dict[str, str],
+    session_attributes: dict[str, Any],
+    prompt_session_attributes: dict[str, Any],
 ) -> dict[str, Any]:
     """Use documented FAILURE / REPROMPT for function-style errors."""
     body_str = json.dumps({"ok": False, "error": message}, default=str)
     function_response = {
-        "actionGroup": event.get("actionGroup", ""),
-        "function": event.get("function", ""),
+        "actionGroup": event.get("actionGroup") or "",
+        "function": event.get("function") or "",
         "functionResponse": {
             "responseState": "FAILURE",
             "responseBody": {
@@ -500,8 +521,8 @@ def _bedrock_function_error(
     return {
         "messageVersion": "1.0",
         "response": function_response,
-        "sessionAttributes": session_attributes,
-        "promptSessionAttributes": prompt_session_attributes,
+        "sessionAttributes": _coerce_session_for_bedrock(session_attributes),
+        "promptSessionAttributes": _coerce_session_for_bedrock(prompt_session_attributes),
     }
 
 
