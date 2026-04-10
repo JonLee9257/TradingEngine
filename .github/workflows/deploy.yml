@@ -14,10 +14,9 @@ concurrency:
 
 jobs:
   deploy:
-    # Required for GitHub "Environment" variables/secrets (e.g. AWS_GITHUB_OIDC_ROLE_ARN).
-    # Create an Environment with this exact name under Settings → Environments, or change the name below.
-    # Repository-level Variables (no environment) work without this line.
-    environment: production
+    # Must match the GitHub Environment name under Settings → Environments (e.g. prod vs production).
+    # Repository-level Variables work without this line if you remove `environment:` entirely.
+    environment: prod
     runs-on: ubuntu-latest
     permissions:
       id-token: write
