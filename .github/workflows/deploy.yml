@@ -33,6 +33,18 @@ jobs:
       - name: Set up SAM CLI
         uses: aws-actions/setup-sam@v2
 
+      # Fail fast with a clear message if the role ARN is missing. When `environment: prod` is set,
+      # also define AWS_GITHUB_OIDC_ROLE_ARN on that Environment (or use repository Variables).
+      - name: Preflight – OIDC role ARN present
+        env:
+          ROLE_ARN: ${{ vars.AWS_GITHUB_OIDC_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::vars.AWS_GITHUB_OIDC_ROLE_ARN is empty. Add it under Settings → Environments → prod → Environment variables, OR under Settings → Secrets and variables → Actions → Variables (repository)."
+            exit 1
+          fi
+          echo "OIDC role ARN is set (not printed)."
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
