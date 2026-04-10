@@ -6,9 +6,9 @@ Architecture:
 
 1. EventBridge cron triggers `news_fetcher` on weekdays at `09:30` (UTC by default).
 2. `news_fetcher` fetches recent news from NewsAPI for the top 10 symbols and sends the payload to an SQS queue.
-3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) for **per-symbol** sentiment (`score` in [-1, 1], `confidence` in [0, 1]) over the headlines in the prompt, computes **`effective_sentiment = score × confidence`** (clamped), stores that as **`sentiment_score`**, and persists raw score + confidence for audit. It also stores backtesting price context in DynamoDB.
+3. `sentiment_analyzer` consumes the SQS message, calls Claude (Anthropic) for **per-symbol** sentiment (`score` in [-1, 1], `confidence` in [0, 1]) over the headlines in the prompt, computes `**effective_sentiment = score × confidence`** (clamped), stores that as `**sentiment_score**`, and persists raw score + confidence for audit. It also stores backtesting price context in DynamoDB.
 4. `sentiment_analyzer` then invokes `trade_executor` synchronously.
-5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls `**strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with `**status=OPEN**`, `**hold_minutes**`, `**strategy_name**`, and `**exit_type**` for the exit manager.
+5. `trade_executor` loads the symbols for the given `run_id`, then for each symbol **queries recent `SENTIMENT` rows on the `TickerTimestampIndex` GSI** (`gsi_pk` = symbol, `gsi_sk` = time) to build **news rows** for the registered strategy. It calls `**strategy.check_live_signal(...)`** and places paper trades via Alpaca (idempotent per symbol per run). New `TRADE` items are written with `**status=OPEN`**, `**hold_minutes**`, `**strategy_name**`, and `**exit_type**` for the exit manager.
 6. `**exit_manager**` (Lambda 4) runs on **EventBridge `rate(1 minute)`**: scans for `**TRADE` + `status=OPEN**`, then exits per `**exit_type**` — `**fixed_time**` (after `submitted_at + hold_minutes`), `**end_of_day**` (within `EXIT_EOD_WINDOW_MINUTES` of Alpaca close), or `**signal_flip**` (strategy `**check_live_signal**` side vs entry side). It submits a flattening market order on Alpaca and sets `**status=CLOSED**`, `**realized_pnl_usd**` (position `unrealized_pl` snapshot at exit), `**exit_alpaca_order_id**`, `**closed_at**`, `**exit_reason**`.
 7. DynamoDB Streams triggers `sentiment_to_s3_parquet`, which appends new `SENTIMENT` rows into an S3 Parquet lake.
 8. A weekly EventBridge Scheduler job runs an ECS Fargate VectorBT backtest task to evaluate threshold quality.
@@ -26,6 +26,33 @@ Architecture:
 - `layers/strategies/python/strategies/` (shared **BaseStrategy** + **MorningSentimentStrategy** — packaged as **Lambda layer** `StrategiesLayer` for `trade_executor` / `exit_manager`; Fargate backtest image copies the same tree to `/app/strategies`)
 - `template.yaml` (AWS SAM IaC)
 - `.env.example` (local environment variable template)
+- `mcp_server.py` + `requirements-mcp.txt` — **FastMCP** gateway exposing the three core Lambdas to Cursor/IDE (see below)
+- `openapi/trading_aws_gateway.openapi.json` — OpenAPI 3.0 for Bedrock Agents / API parity with MCP tools
+- `lambdas/bedrock_trading_router/` — optional Bedrock action-group router that invokes the same Lambdas
+
+## MCP (Model Context Protocol) — `Trading AWS Gateway`
+
+The repo includes a small **FastMCP** server (`mcp_server.py`) so assistants can call the same Lambdas as the production pipeline **without** using raw `aws lambda invoke` in the terminal (see `.cursor/rules/05-mcp-aws-gateway.mdc`).
+
+**Install (local / CI for the MCP process):**
+
+```bash
+pip install -r requirements-mcp.txt
+```
+
+**Tools (mirror the core Lambdas):**
+
+
+| MCP tool            | Lambda                                                |
+| ------------------- | ----------------------------------------------------- |
+| `fetch_market_news` | `news_fetcher`                                        |
+| `analyze_sentiment` | `sentiment_analyzer` (pass SQS-shaped `message_body`) |
+| `execute_trade`     | `trade_executor`                                      |
+
+
+**Configure Cursor:** add the server in **Settings → MCP**, or use the project file `**.cursor/mcp.json`** (registers `TradingBot` → `python3 mcp_server.py`). If `${workspaceFolder}` is not expanded on your build, replace `args` with the **absolute path** to `mcp_server.py`. Restart Cursor after changes. The process needs **AWS credentials** with `lambda:InvokeFunction` on the three functions.
+
+**Override Lambda names** (e.g. after redeploy) with env vars: `MCP_NEWS_FETCHER_FUNCTION_NAME`, `MCP_SENTIMENT_ANALYZER_FUNCTION_NAME`, `MCP_TRADE_EXECUTOR_FUNCTION_NAME` (defaults are set in `mcp_server.py`).
 
 ## Prerequisites
 
@@ -92,7 +119,7 @@ EventBridge schedule:
 sam build
 ```
 
-`TradeExecutorFunction` and `ExitManagerFunction` attach **`StrategiesLayer`**, whose content is `layers/strategies/` (zip layout `python/strategies/...`). No per-function Makefile is required, and `sam build --use-container` only needs each function’s `CodeUri` directory.
+`TradeExecutorFunction` and `ExitManagerFunction` attach `**StrategiesLayer**`, whose content is `layers/strategies/` (zip layout `python/strategies/...`). No per-function Makefile is required, and `sam build --use-container` only needs each function’s `CodeUri` directory.
 
 **Local Python** (e.g. running `backtester/backtest_engine.py` on your machine): put the layer’s `python` folder on `PYTHONPATH`:
 
@@ -102,9 +129,9 @@ export PYTHONPATH="${PWD}/layers/strategies/python${PYTHONPATH:+:$PYTHONPATH}"
 
 **Deploy configuration**
 
-- **`template.yaml`** holds parameter **`Default`** values (e.g. `AnthropicModel`, thresholds, `TopSymbols`). Change behavior here first.
-- **`samconfig.toml`** should only carry **deploy metadata** (stack name, region, capabilities—not a long `parameter_overrides` string that duplicates the template and drifts).
-- **GitHub Actions** (`.github/workflows/deploy.yml`) passes **required** parameters (secret ids, `BacktestLakeBucketName`) and **`AnthropicModel`** (defaults to `claude-haiku-4-5-20251001` so the stack does not keep a stale retired model id). Override with repo Variable **`ANTHROPIC_MODEL`** if needed.
+- `**template.yaml`** holds parameter `**Default**` values (e.g. `AnthropicModel`, thresholds, `TopSymbols`). Change behavior here first.
+- `**samconfig.toml**` should only carry **deploy metadata** (stack name, region, capabilities—not a long `parameter_overrides` string that duplicates the template and drifts).
+- **GitHub Actions** (`.github/workflows/deploy.yml`) passes **required** parameters (secret ids, `BacktestLakeBucketName`) and `**AnthropicModel`** (defaults to `claude-haiku-4-5-20251001` so the stack does not keep a stale retired model id). Override with repo Variable `**ANTHROPIC_MODEL**` if needed.
 
 **Existing stacks:** CloudFormation **keeps** the previous value for any parameter you omit on `sam deploy`. Editing `Default` in `template.yaml` does **not** automatically change live Lambdas until you pass that parameter once (or change it in the console / a changeset).
 
@@ -155,7 +182,7 @@ sam deploy \
 `sentiment_analyzer` stores one `SENTIMENT#<symbol>` item per symbol/run with fields for backtesting:
 
 - Core sentiment:
-  - `sentiment_score` — **effective** value used everywhere downstream (time decay, `check_live_signal`, backtest lake): **`model_score × confidence`**, clamped to [-1, 1]. The field name is unchanged so `trade_executor`, `exit_manager`, and `Sentiment_V1` keep reading the same attribute.
+  - `sentiment_score` — **effective** value used everywhere downstream (time decay, `check_live_signal`, backtest lake): `**model_score × confidence`**, clamped to [-1, 1]. The field name is unchanged so `trade_executor`, `exit_manager`, and `Sentiment_V1` keep reading the same attribute.
   - `sentiment_raw_score` — Claude’s directional **score** before confidence scaling (audit / research).
   - `sentiment_confidence` — Claude’s **confidence** [0, 1] (how much to trust the call as a market mover; fluff / non-financial news should land low per prompt rules).
   - `sentiment_label`, `rationale`
@@ -172,7 +199,7 @@ Market-session handling:
 
 ## Strategy-Based Trading
 
-`trade_executor` loads **strategy config** from DynamoDB, builds a `**LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls `**check_live_signal(current_prices, current_news, ...)**` where:
+`trade_executor` loads **strategy config** from DynamoDB, builds a `**LiveSentimentStrategy`** via `get_strategy_instance(...)`, then calls `**check_live_signal(current_prices, current_news, ...)`** where:
 
 - `**current_news**`: list of row dicts (`sentiment_score`, `news_published_at`, `analyzed_at`, and optionally `sentiment_raw_score` / `sentiment_confidence`) from the last 7d of `SENTIMENT` items (same logical columns as a pandas DataFrame).
 - `**current_prices**`: list of recent 1m bar dicts from Alpaca (`timestamp`, OHLCV); empty if data API creds are missing or the request fails (strategy is news-driven today).
@@ -181,7 +208,7 @@ If `check_live_signal` returns a side, the handler calls `**_place_order**` (Alp
 
 ### Time-decayed sentiment (live)
 
-For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay w = e^{-\lambda t}, t = age in hours. Each row’s weight is applied to **`sentiment_score`** (the **effective** score); **`sentiment_raw_score`** / **`sentiment_confidence`** are not inputs to the decay math unless you extend the strategy.
+For each symbol in the current `run_id`, the executor **does not** use only that run’s single `SENTIMENT` row. It **queries `TickerTimestampIndex`** for all `SENTIMENT` items for that symbol and computes a **weighted average** with exponential decay w = e^{-\lambda t}, t = age in hours. Each row’s weight is applied to `**sentiment_score`** (the **effective** score); `**sentiment_raw_score`** / `**sentiment_confidence**` are not inputs to the decay math unless you extend the strategy.
 
 - **Primary window:** last **24 hours**, \lambda = 0.1
 - **Fallback:** if empty, last **7 days**, \lambda = 0.5
@@ -329,7 +356,7 @@ Cache behavior:
 **Strategy Pattern layout (`backtester/backtest_engine.py`):**
 
 - `**BaseStrategy`**: abstract `generate_signals(price_df, news_df) -> (entries, exits)` returning boolean pandas Series.
-- `**MorningSentimentStrategy**`: concrete strategy with existing 9:30 ET entries + 24h decayed sentiment (7d fallback) logic moved into the class.
+- `**MorningSentimentStrategy`**: concrete strategy with existing 9:30 ET entries + 24h decayed sentiment (7d fallback) logic moved into the class.
 - `**exit_type**` supported by constructor: `fixed_time`, `end_of_day`, `signal_flip`.
 - **Threshold optimization** is generic: runner sets threshold, strategy generates signals, VectorBT evaluates.
 

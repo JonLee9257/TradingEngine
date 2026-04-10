@@ -9,6 +9,8 @@ alwaysApply: true
 - `run_id` is the correlation key across the entire pipeline; keep it stable per batch/job.
 - `trade_executor` must remain idempotent per (`run_id`, `symbol`) using DynamoDB conditional writes.
 
+- **MCP:** `mcp_server.py` exposes `fetch_market_news`, `analyze_sentiment`, and `execute_trade` (FastMCP → `boto3` Lambda invoke). Prefer this over ad-hoc AWS CLI for those calls; see `.cursor/mcp.json` and `05-mcp-aws-gateway.mdc`.
+
 # CloudWatch P&L conventions (custom metrics)
 
 - Only publish numeric fields via `PutMetricData`; CloudWatch metrics cannot use strings.
