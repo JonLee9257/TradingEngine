@@ -14,9 +14,9 @@ concurrency:
 
 jobs:
   deploy:
-    # Must match the GitHub Environment name under Settings → Environments (e.g. prod vs production).
-    # Repository-level Variables work without this line if you remove `environment:` entirely.
-    environment: prod
+    # No `environment:` here — same as branch release/tradingEngine (working). Adding
+    # `environment: name` changes the OIDC `sub` to `repo:ORG/REPO:environment:NAME` and
+    # requires matching IAM trust + GitHub Environment variables. Use repository Variables for AWS_GITHUB_OIDC_ROLE_ARN.
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -33,14 +33,12 @@ jobs:
       - name: Set up SAM CLI
         uses: aws-actions/setup-sam@v2
 
-      # Fail fast with a clear message if the role ARN is missing. When `environment: prod` is set,
-      # also define AWS_GITHUB_OIDC_ROLE_ARN on that Environment (or use repository Variables).
       - name: Preflight – OIDC role ARN present
         env:
           ROLE_ARN: ${{ vars.AWS_GITHUB_OIDC_ROLE_ARN }}
         run: |
           if [ -z "$ROLE_ARN" ]; then
-            echo "::error::vars.AWS_GITHUB_OIDC_ROLE_ARN is empty. Add it under Settings → Environments → prod → Environment variables, OR under Settings → Secrets and variables → Actions → Variables (repository)."
+            echo "::error::vars.AWS_GITHUB_OIDC_ROLE_ARN is empty. Set it under Settings → Secrets and variables → Actions → Variables (repository)."
             exit 1
           fi
           echo "OIDC role ARN is set (not printed)."
