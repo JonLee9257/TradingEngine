@@ -1,0 +1,28 @@
+---
+description: Prefer Trading MCP (user-TradingBot) for Lambda/DynamoDB; avoid raw AWS CLI for those operations
+alwaysApply: true
+---
+
+# AWS operations: use MCP first (`user-TradingBot`)
+
+When a task requires **invoking trading Lambdas** or **reading/writing trading DynamoDB data** that the project exposes via MCP, **do not** generate or run terminal commands such as:
+
+- `aws lambda invoke` (and similar `aws lambda` invoke-style calls)
+- `aws dynamodb query`, `aws dynamodb scan`, `aws dynamodb get-item`, etc.
+
+**Instead:** use the **connected MCP server `user-TradingBot`** (see Cursor MCP settings) and its tools, in order of pipeline:
+
+- `fetch_market_news` — news_fetcher Lambda
+- `analyze_sentiment` — sentiment_analyzer Lambda (synthetic SQS payload)
+- `execute_trade` — trade_executor Lambda
+
+Use `call_mcp_tool` (or the editor’s MCP integration) with server **`user-TradingBot`** and the appropriate **`toolName`** / arguments.
+
+# If MCP cannot cover the request
+
+If the needed operation **is not** available as an MCP tool (e.g. arbitrary DynamoDB ad-hoc queries, non-trading Lambdas), **say that clearly**, outline what is missing, and offer alternatives: extend `mcp_server.py`, use the AWS Console, or ask the user to run specific AWS CLI themselves—**do not** silently substitute raw `aws lambda` / `aws dynamodb` CLI in the agent unless the **user explicitly** asks for CLI commands.
+
+# Exceptions (unchanged)
+
+- **IaC / validation** from other rules (e.g. `sam validate --lint`) is **not** covered by this rule.
+- **Unit tests** and **local Python** that do not call production AWS are **not** covered by this rule.

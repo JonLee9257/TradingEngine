@@ -1,0 +1,287 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Trading AWS Gateway (MCP tools parity)",
+    "description": "OpenAPI mapping of FastMCP tools in mcp_server.py: Lambda-backed news fetch, sentiment analysis (SQS-shaped payload), and trade execution. Align request bodies with your API/Lambda integration layer.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://example.execute-api.us-east-1.amazonaws.com/prod",
+      "description": "Replace with your API Gateway base URL or Bedrock Action Group proxy."
+    }
+  ],
+  "paths": {
+    "/fetch_market_news": {
+      "post": {
+        "operationId": "fetch_market_news",
+        "summary": "Fetch market news (news_fetcher Lambda)",
+        "description": "Invoke the news_fetcher Lambda to pull recent headlines for configured symbols (TOP_SYMBOLS in Lambda env) and enqueue a batch message for sentiment analysis (typically SQS). Optional EventBridge-shaped payload; empty body is valid. Returns status, run_id, symbols, or an error payload.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchMarketNewsRequest"
+              },
+              "examples": {
+                "empty": {
+                  "summary": "Default (same as MCP: no event)",
+                  "value": {}
+                },
+                "eventbridge_time": {
+                  "summary": "Optional schedule time",
+                  "value": {
+                    "event": {
+                      "time": "2026-04-09T14:30:00Z"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Invocation result (ok/function_name/response or error envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LambdaInvokeEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyze_sentiment": {
+      "post": {
+        "operationId": "analyze_sentiment",
+        "summary": "Analyze sentiment (sentiment_analyzer Lambda)",
+        "description": "Invoke sentiment_analyzer with a synthetic SQS event whose Record body is JSON matching news_fetcher SQS messages. Requires run_id, symbols (non-empty), and articles_by_symbol. Runs Claude, writes SENTIMENT rows to DynamoDB, may invoke trade_executor. Returns Lambda handler response (e.g. status, processed) or error.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyzeSentimentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Invocation result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LambdaInvokeEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/execute_trade": {
+      "post": {
+        "operationId": "execute_trade",
+        "summary": "Execute paper trades (trade_executor Lambda)",
+        "description": "Invoke trade_executor with pipeline run_id. Must match SENTIMENT rows for that run. Loads strategy config, queries sentiment from DynamoDB, places idempotent Alpaca paper trades.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteTradeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Invocation result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LambdaInvokeEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "FetchMarketNewsRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "event": {
+            "type": "object",
+            "description": "Optional EventBridge-style payload forwarded as the Lambda event dict. Omitted or empty object {} matches MCP default.",
+            "additionalProperties": true,
+            "properties": {
+              "time": {
+                "type": "string",
+                "description": "Schedule / trigger time (ISO-8601), if present.",
+                "example": "2026-04-09T14:30:00Z"
+              },
+              "detail": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Optional detail bag (e.g. nested time)."
+              }
+            }
+          }
+        }
+      },
+      "AnalyzeSentimentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["message_body"],
+        "properties": {
+          "message_body": {
+            "$ref": "#/components/schemas/SentimentQueueMessageBody",
+            "description": "Exact JSON that news_fetcher puts in SQS MessageBody (and MCP passes to sentiment_analyzer)."
+          }
+        }
+      },
+      "SentimentQueueMessageBody": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "SQS message JSON string content. Core fields below are required by sentiment_analyzer; extra keys are ignored safely.",
+        "required": ["run_id", "symbols", "articles_by_symbol"],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Correlation id for the batch; must be unique per pipeline run."
+          },
+          "triggered_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the news job was triggered (ISO-8601 UTC)."
+          },
+          "symbols": {
+            "type": "array",
+            "description": "Uppercase tickers to analyze; must be non-empty (validated in sentiment_analyzer).",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Z0-9.-]+$",
+              "example": "TSLA"
+            }
+          },
+          "lookback_hours": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 168,
+            "description": "News lookback window in hours (matches news_fetcher env NEWS_LOOKBACK_HOURS semantics)."
+          },
+          "articles_by_symbol": {
+            "type": "object",
+            "description": "Map each symbol to a list of normalized NewsAPI-style articles (may be empty lists per symbol).",
+            "minProperties": 0,
+            "additionalProperties": {
+              "$ref": "#/components/schemas/NewsArticleList"
+            }
+          },
+          "source": {
+            "$ref": "#/components/schemas/NewsFetchSourceMeta",
+            "description": "Optional provenance (news_fetcher sets lambda_request_id, fetched_at; MCP may add tags)."
+          }
+        }
+      },
+      "NewsArticleList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/NewsArticle"
+        }
+      },
+      "NewsArticle": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Normalized article row from news_fetcher (_fetch_news_api).",
+        "required": ["title", "description", "url", "publishedAt"],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "publishedAt": {
+            "type": "string",
+            "description": "Publication time string from NewsAPI (often ISO-8601).",
+            "example": "2026-04-09T12:00:00Z"
+          }
+        }
+      },
+      "NewsFetchSourceMeta": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "lambda_request_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "AWS request id when produced by news_fetcher."
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time when articles were assembled."
+          },
+          "mcp": {
+            "type": "string",
+            "description": "Optional tag when invoked via MCP."
+          }
+        }
+      },
+      "ExecuteTradeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id"],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Must match the run_id for which SENTIMENT items exist in DynamoDB."
+          }
+        }
+      },
+      "LambdaInvokeEnvelope": {
+        "type": "object",
+        "description": "Shape returned by mcp_server._invoke_lambda (not the raw Lambda-only body).",
+        "required": ["ok"],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "function_name": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "response": {
+            "description": "Parsed Lambda payload on success.",
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "string",
+            "description": "Present when ok is false (boto/Lambda FunctionError)."
+          }
+        }
+      }
+    }
+  }
+}

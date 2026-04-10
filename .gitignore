@@ -1,5 +1,6 @@
 .aws-sam/
 .venv/
+.venv-mcp/
 .venv-test/
 __pycache__/
 *.pyc

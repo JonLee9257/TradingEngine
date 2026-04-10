@@ -1,0 +1,3 @@
+# Dependencies for mcp_server.py (FastMCP + boto3 Lambda/DynamoDB gateway)
+fastmcp>=2.0
+boto3>=1.34
