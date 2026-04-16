@@ -21,6 +21,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -105,20 +106,44 @@ def _parse_json_property(val: Any) -> Any:
     return val
 
 
+def _normalize_bedrock_api_path(raw: str) -> str:
+    """
+    Bedrock usually sends apiPath as in the OpenAPI file (e.g. /fetch_market_news).
+    Some integrations send no leading slash or a full URL — normalize so routing matches.
+    """
+    s = (raw or "").strip().split("?")[0].strip()
+    if not s:
+        return "/"
+    if "://" in s:
+        s = urlparse(s).path or "/"
+    if not s.startswith("/"):
+        s = f"/{s}"
+    s = s.rstrip("/")
+    return s if s else "/"
+
+
 def _extract_openapi_body_dict(event: dict[str, Any]) -> dict[str, Any]:
-    """Bedrock OpenAPI: requestBody.content['application/json'].properties -> list of {name,type,value}."""
-    rb = event.get("requestBody") or {}
-    content = rb.get("content") or {}
-    # Key may be application/json
-    for key in ("application/json", "application/json;charset=utf-8"):
-        if key in content:
-            props = content[key].get("properties")
-            return _props_list_to_dict(props if isinstance(props, list) else [])
-    # Fallback: first content type
+    """Bedrock OpenAPI: requestBody.content['application/json'].properties OR .body JSON string."""
+    rb = event.get("requestBody")
+    if not isinstance(rb, dict):
+        return {}
+    content = rb.get("content")
+    if not isinstance(content, dict):
+        return {}
     for _ct, body in content.items():
-        props = body.get("properties") if isinstance(body, dict) else None
-        if isinstance(props, list):
+        if not isinstance(body, dict):
+            continue
+        props = body.get("properties")
+        if isinstance(props, list) and props:
             return _props_list_to_dict(props)
+        raw_body = body.get("body")
+        if isinstance(raw_body, str) and raw_body.strip():
+            try:
+                parsed = json.loads(raw_body)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
     return {}
 
 
@@ -136,6 +161,7 @@ def _invoke_lambda_sync(function_name: str, payload: dict[str, Any]) -> dict[str
 
     raw_bytes = resp.get("Payload").read() if resp.get("Payload") else b""
     text = raw_bytes.decode("utf-8", errors="replace") if raw_bytes else ""
+    status_code = resp.get("StatusCode")
     try:
         parsed = json.loads(text) if text.strip() else {}
     except json.JSONDecodeError:
@@ -145,11 +171,31 @@ def _invoke_lambda_sync(function_name: str, payload: dict[str, Any]) -> dict[str
         return {
             "ok": False,
             "function_name": function_name,
+            "status_code": status_code,
             "error": parsed.get("errorMessage") or json.dumps(parsed, default=str),
-            "lambda_response": parsed,
+            "response": parsed,
         }
 
-    return {"ok": True, "function_name": function_name, "lambda_response": parsed}
+    return {"ok": True, "function_name": function_name, "status_code": status_code, "response": parsed}
+
+
+def _openapi_action_body(*, inv: dict[str, Any], step: str, next_obj: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Payload inside responseBody.application/json.body — matches OpenAPI LambdaInvokeEnvelope + step/next."""
+    body: dict[str, Any] = {
+        "ok": bool(inv.get("ok")),
+        "function_name": inv.get("function_name") or "",
+    }
+    if inv.get("status_code") is not None:
+        body["status_code"] = inv["status_code"]
+    if inv.get("error"):
+        body["error"] = str(inv["error"])
+    inner = inv.get("response")
+    if isinstance(inner, dict):
+        body["response"] = inner
+    body["step"] = step
+    if next_obj is not None:
+        body["next"] = next_obj
+    return body
 
 
 def _build_message_body_after_fetch(
@@ -179,7 +225,8 @@ def _bedrock_openapi_success(
     prompt_session_attributes: dict[str, Any],
 ) -> dict[str, Any]:
     """Amazon Bedrock OpenAPI action group success: body must be a JSON *string*."""
-    body_str = json.dumps(payload_obj, default=str, ensure_ascii=False)
+    # ASCII-safe JSON string: some Bedrock paths are strict about response body encoding.
+    body_str = json.dumps(payload_obj, default=str, ensure_ascii=True)
     response_body = {
         "application/json": {
             "body": body_str,
@@ -229,7 +276,8 @@ def _bedrock_function_success(
     Function-details action group success: TEXT body with JSON string (docs allow TEXT content type).
     Omit responseState on success (only FAILURE | REPROMPT are documented for errors).
     """
-    body_str = json.dumps(payload_obj, default=str, ensure_ascii=False)
+    # ASCII-safe JSON string: some Bedrock paths are strict about response body encoding.
+    body_str = json.dumps(payload_obj, default=str, ensure_ascii=True)
     function_response = {
         "actionGroup": event.get("actionGroup") or "",
         "function": event.get("function") or "",
@@ -253,7 +301,8 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
     session_attrs = dict(event.get("sessionAttributes") or {})
     prompt_attrs = dict(event.get("promptSessionAttributes") or {})
 
-    api_path = (event.get("apiPath") or "").split("?")[0].rstrip("/") or "/"
+    raw_path = event.get("apiPath")
+    api_path = _normalize_bedrock_api_path(str(raw_path) if raw_path is not None else "")
     method = (event.get("httpMethod") or "POST").upper()
     body_fields = _extract_openapi_body_dict(event)
 
@@ -275,7 +324,7 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 prompt_session_attributes=prompt_attrs,
             )
 
-        lr = inv.get("lambda_response") or {}
+        lr = inv.get("response") or {}
         run_id = lr.get("run_id")
         symbols = lr.get("symbols") or []
 
@@ -286,15 +335,17 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
             session_attrs["last_trading_run_id"] = str(run_id)
             session_attrs["last_symbols_json"] = json.dumps(symbols, default=str)
 
-        out: dict[str, Any] = {
-            "ok": True,
-            "step": "fetch_market_news",
-            "lambda": inv,
-            "next": {
-                "description": "Call POST /analyze_sentiment with message_body (or rely on session pending_analyze_sentiment_message_body).",
+        out = _openapi_action_body(
+            inv=inv,
+            step="fetch_market_news",
+            next_obj={
+                "description": (
+                    "Call POST /analyze_sentiment with message_body "
+                    "(or rely on session pending_analyze_sentiment_message_body)."
+                ),
                 "message_body": message_body,
             },
-        }
+        )
         return _bedrock_openapi_success(
             event,
             http_status=200,
@@ -351,20 +402,18 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 prompt_session_attributes=prompt_attrs,
             )
 
-        lr = inv.get("lambda_response") or {}
         run_id = message_body.get("run_id")
         if run_id:
             session_attrs["last_trading_run_id"] = str(run_id)
 
-        out = {
-            "ok": True,
-            "step": "analyze_sentiment",
-            "lambda": inv,
-            "next": {
+        out = _openapi_action_body(
+            inv=inv,
+            step="analyze_sentiment",
+            next_obj={
                 "description": "Call POST /execute_trade with run_id when ready.",
                 "run_id": str(run_id) if run_id else None,
             },
-        }
+        )
         return _bedrock_openapi_success(
             event,
             http_status=200,
@@ -401,7 +450,7 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 prompt_session_attributes=prompt_attrs,
             )
 
-        out = {"ok": True, "step": "execute_trade", "lambda": inv}
+        out = _openapi_action_body(inv=inv, step="execute_trade", next_obj=None)
         return _bedrock_openapi_success(
             event,
             http_status=200,
@@ -410,6 +459,10 @@ def _route_openapi(event: dict[str, Any], context: Any) -> dict[str, Any]:
             prompt_session_attributes=prompt_attrs,
         )
 
+    logger.warning(
+        "Unknown Bedrock OpenAPI route",
+        extra={"httpMethod": method, "apiPath_raw": raw_path, "apiPath_normalized": api_path},
+    )
     return _bedrock_openapi_error(
         event,
         http_status=404,
@@ -432,7 +485,7 @@ def _route_function(event: dict[str, Any], context: Any) -> dict[str, Any]:
         inv = _invoke_lambda_sync(_lambda_name_news(), payload)
         if not inv.get("ok"):
             return _bedrock_function_error(event, inv.get("error", "error"), session_attrs, prompt_attrs)
-        lr = inv.get("lambda_response") or {}
+        lr = inv.get("response") or {}
         run_id = lr.get("run_id")
         symbols = lr.get("symbols") or []
         message_body = None
@@ -440,12 +493,11 @@ def _route_function(event: dict[str, Any], context: Any) -> dict[str, Any]:
             message_body = _build_message_body_after_fetch(run_id=str(run_id), symbols=symbols)
             session_attrs["pending_analyze_sentiment_message_body"] = json.dumps(message_body, default=str)
             session_attrs["last_trading_run_id"] = str(run_id)
-        out = {
-            "ok": True,
-            "step": "fetch_market_news",
-            "lambda": inv,
-            "next": {"message_body": message_body},
-        }
+        out = _openapi_action_body(
+            inv=inv,
+            step="fetch_market_news",
+            next_obj={"message_body": message_body},
+        )
         return _bedrock_function_success(event, payload_obj=out, session_attributes=session_attrs, prompt_session_attributes=prompt_attrs)
 
     if fn == "analyze_sentiment":
@@ -482,7 +534,14 @@ def _route_function(event: dict[str, Any], context: Any) -> dict[str, Any]:
         run_id = mb.get("run_id")
         if run_id:
             session_attrs["last_trading_run_id"] = str(run_id)
-        out = {"ok": True, "step": "analyze_sentiment", "lambda": inv}
+        out = _openapi_action_body(
+            inv=inv,
+            step="analyze_sentiment",
+            next_obj={
+                "description": "Call execute_trade with run_id when ready.",
+                "run_id": str(run_id) if run_id else None,
+            },
+        )
         return _bedrock_function_success(event, payload_obj=out, session_attributes=session_attrs, prompt_session_attributes=prompt_attrs)
 
     if fn == "execute_trade":
@@ -492,7 +551,7 @@ def _route_function(event: dict[str, Any], context: Any) -> dict[str, Any]:
         inv = _invoke_lambda_sync(_lambda_name_trade(), {"run_id": run_id})
         if not inv.get("ok"):
             return _bedrock_function_error(event, inv.get("error", "error"), session_attrs, prompt_attrs)
-        out = {"ok": True, "step": "execute_trade", "lambda": inv}
+        out = _openapi_action_body(inv=inv, step="execute_trade", next_obj=None)
         return _bedrock_function_success(event, payload_obj=out, session_attributes=session_attrs, prompt_session_attributes=prompt_attrs)
 
     return _bedrock_function_error(event, f"Unknown function {fn}", session_attrs, prompt_attrs)
@@ -532,7 +591,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Prefer OpenAPI (apiPath + httpMethod); fall back to function name.
     """
     try:
-        if event.get("apiPath"):
+        if "apiPath" in event:
             return _route_openapi(event, context)
         if event.get("function"):
             return _route_function(event, context)

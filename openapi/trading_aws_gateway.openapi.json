@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Trading AWS Gateway (MCP tools parity)",
-    "description": "OpenAPI mapping of FastMCP tools in mcp_server.py: Lambda-backed news fetch, sentiment analysis (SQS-shaped payload), and trade execution. Align request bodies with your API/Lambda integration layer.",
+    "description": "OpenAPI mapping of FastMCP tools in mcp_server.py: Lambda-backed news fetch, sentiment analysis (SQS-shaped payload), and trade execution. For Amazon Bedrock Agents, attach this schema to an action group and implement the single router Lambda (lambdas/bedrock_trading_router/app.py); 200 response bodies must match LambdaInvokeEnvelope (ok, function_name, status_code, response, optional step/next).",
     "version": "1.0.0"
   },
   "servers": [
@@ -158,8 +158,7 @@
         "properties": {
           "run_id": {
             "type": "string",
-            "format": "uuid",
-            "description": "Correlation id for the batch; must be unique per pipeline run."
+            "description": "Correlation id for the batch (UUID recommended); must be unique per pipeline run."
           },
           "triggered_at": {
             "type": "string",
@@ -216,7 +215,7 @@
           },
           "url": {
             "type": "string",
-            "format": "uri"
+            "description": "Article URL; may be empty if the source omitted it."
           },
           "publishedAt": {
             "type": "string",
@@ -252,15 +251,15 @@
         "properties": {
           "run_id": {
             "type": "string",
-            "format": "uuid",
             "description": "Must match the run_id for which SENTIMENT items exist in DynamoDB."
           }
         }
       },
       "LambdaInvokeEnvelope": {
         "type": "object",
-        "description": "Shape returned by mcp_server._invoke_lambda (not the raw Lambda-only body).",
+        "description": "Returned by the Bedrock router and mcp_server._invoke_lambda: outer envelope plus optional routing hints. The inner Lambda JSON is in \"response\" (e.g. news_fetcher: status, run_id, symbols).",
         "required": ["ok"],
+        "additionalProperties": true,
         "properties": {
           "ok": {
             "type": "boolean"
@@ -269,16 +268,26 @@
             "type": "string"
           },
           "status_code": {
-            "type": "integer"
+            "type": "integer",
+            "description": "AWS Lambda Invoke API HTTP status (200 when invoke succeeded)."
           },
           "response": {
-            "description": "Parsed Lambda payload on success.",
+            "description": "Parsed target Lambda payload on success (not the boto invoke envelope).",
             "type": "object",
             "additionalProperties": true
           },
           "error": {
             "type": "string",
             "description": "Present when ok is false (boto/Lambda FunctionError)."
+          },
+          "step": {
+            "type": "string",
+            "description": "Router step id: fetch_market_news | analyze_sentiment | execute_trade."
+          },
+          "next": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Optional hints for the following tool call (message_body, run_id, description)."
           }
         }
       }
